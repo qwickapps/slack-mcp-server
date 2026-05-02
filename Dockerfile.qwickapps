@@ -1,0 +1,61 @@
+# QwickApps deployment Dockerfile for slack-mcp-server.
+# This is a WRAPPER image — it pulls the pre-built binary from the upstream
+# published image and runs it inside the qwickapps-base image with the
+# canonical Tailscale entrypoint.
+#
+# This file is NOT upstream's Dockerfile (which builds from source).
+# Upstream's Dockerfile is preserved at ./Dockerfile for reference.
+#
+# IMPORTANT: Port is controlled by the SLACK_MCP_PORT environment variable
+# (default 13080). The binary does NOT accept a --port CLI flag. The SSE
+# endpoint is served at :<SLACK_MCP_PORT>/sse.
+#
+# To update the upstream pin:
+#   1. Find the new tag + digest:
+#      docker manifest inspect ghcr.io/korotovsky/slack-mcp-server:<new-tag>
+#   2. Update UPSTREAM_TAG and UPSTREAM_DIGEST below.
+#   3. Update UPSTREAM.md with the new version and date.
+
+# Pin upstream by tag AND digest. Update both when syncing.
+# v1.2.3 | sha256:7ae77761d9f6e8da2b0fc7e7bf9f489615865af533990e0e06bc3eed49e0b91e
+FROM ghcr.io/korotovsky/slack-mcp-server:v1.2.3@sha256:7ae77761d9f6e8da2b0fc7e7bf9f489615865af533990e0e06bc3eed49e0b91e AS upstream
+
+# qwickapps-base ships node + curl + tailscale + ca-certificates (see qwickapps/node Dockerfile).
+# If a future base rebuild drops these, the build below will fail loudly — that is the desired failure mode.
+FROM ghcr.io/qwickapps/qwickapps-base:latest@sha256:ecad995099c1dc8f1ad690be6ddb7cb0ad3d415cd948810170cf259e171c89b2
+USER root
+
+# Pull upstream binary out of upstream image.
+# Source path confirmed from upstream Dockerfile: /usr/local/bin/mcp-server
+COPY --from=upstream /usr/local/bin/mcp-server /usr/local/bin/mcp-server
+
+# Tailscale entrypoint (QwickApps canonical v1.2 — do not customize).
+COPY entrypoint.qwickapps.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+WORKDIR /app
+
+# SLACK_MCP_PORT controls the SSE/HTTP bind port (upstream reads this env var).
+# SLACK_MCP_HOST controls the bind host (default 127.0.0.1 upstream; set to
+# 0.0.0.0 so CapRover's proxy can reach the container port).
+# PORT is read by the Tailscale entrypoint to set up `tailscale serve`.
+ENV PORT=13080 \
+    SLACK_MCP_PORT=13080 \
+    SLACK_MCP_HOST=0.0.0.0
+
+EXPOSE 13080
+
+# entrypoint.sh sets up Tailscale + Tailscale Serve, then exec's CMD.
+ENTRYPOINT ["/app/entrypoint.sh"]
+
+# Phase 1: run upstream binary directly.
+# P3 will replace this CMD with the multiplexer (cmd/slack-mcp-multiplexer).
+CMD ["/usr/local/bin/mcp-server", "--transport", "sse"]
+
+# The SSE endpoint at /sse is the liveness indicator for the MCP server.
+# curl exit 28 (operation timeout) means the connection was established and the server
+# returned 200 OK but kept the stream open — that is healthy. Exit 0 is also healthy.
+# Any other exit code (7=connection refused, 22=HTTP error, etc.) is unhealthy.
+# Shell form (sh -c) is required so ${SLACK_MCP_PORT} expands at runtime.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD sh -c 'curl -fsS --max-time 2 http://localhost:${SLACK_MCP_PORT}/sse >/dev/null 2>&1; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 28 ]'

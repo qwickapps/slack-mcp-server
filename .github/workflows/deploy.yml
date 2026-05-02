@@ -1,0 +1,258 @@
+# Caller workflow. Calls ./.github/workflows/deploy-app.yml.
+#
+# This is a Go binary container — no database at P1/P2. The db-wipe and
+# db-clone jobs are retained in skeleton form for P3+ (token-bridge will
+# require a DB). They skip gracefully when ADMIN_URL secrets are absent.
+#
+# Port note: the upstream binary reads SLACK_MCP_PORT (default 13080).
+# There is no --port CLI flag. PORT and SLACK_MCP_PORT are both set in
+# the env file written below so entrypoint.sh and the binary agree.
+
+name: Deploy slack-mcp-server
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'Dockerfile.qwickapps'
+      - 'entrypoint.qwickapps.sh'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, uat, prod]
+        default: dev
+
+concurrency:
+  group: slack-mcp-server-deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Resolve environment ─────────────────────────────────────────────────────
+  resolve-env:
+    runs-on: [self-hosted, macmini]
+    outputs:
+      environment:   ${{ steps.env.outputs.environment }}
+      public_url:    ${{ steps.env.outputs.public_url }}
+      caprover_host: ${{ steps.env.outputs.caprover_host }}
+    steps:
+      - name: Determine environment and URLs
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ inputs.environment }}"
+          elif echo "${{ github.ref }}" | grep -q '^refs/tags/slack-mcp-server-v'; then
+            ENV="prod"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            ENV="uat"
+          else
+            ENV="dev"
+          fi
+
+          case "$ENV" in
+            prod)
+              PUBLIC_URL="https://slack-mcp-server.app.qwickforge.com"
+              CAPROVER_HOST="captain.app.qwickforge.com"
+              ;;
+            uat)
+              PUBLIC_URL="https://slack-mcp-server-uat.app.qwickforge.com"
+              CAPROVER_HOST="captain.app.qwickforge.com"
+              ;;
+            *)
+              PUBLIC_URL="https://slack-mcp-server.dev.qwickforge.com"
+              CAPROVER_HOST="captain.dev.qwickforge.com"
+              ;;
+          esac
+
+          echo "environment=${ENV}"               >> "$GITHUB_OUTPUT"
+          echo "public_url=${PUBLIC_URL}"         >> "$GITHUB_OUTPUT"
+          echo "caprover_host=${CAPROVER_HOST}"   >> "$GITHUB_OUTPUT"
+
+      - name: Guard against feature-branch deploys
+        run: |
+          REF="${{ github.ref }}"
+          EVENT="${{ github.event_name }}"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "Dispatch source: workflow_dispatch — OK"
+          elif echo "$REF" | grep -q '^refs/tags/'; then
+            echo "Dispatch source: tag push — OK"
+          elif [ "$REF" = "refs/heads/main" ] || [ "$REF" = "refs/heads/master" ]; then
+            echo "Dispatch source: protected branch push — OK"
+          else
+            echo "ERROR: Workflow triggered from feature branch: $REF"
+            echo "Use workflow_dispatch from master/main instead."
+            exit 1
+          fi
+
+  # ── Write slack-mcp-server env file ────────────────────────────────────────
+  # Writes /tmp/app-env-slack-mcp-server.env for deploy-app.yml's
+  # provision-app job. All values come from GitHub Actions secrets named
+  # SLACK_MCP_SERVER_<ENV>_<VAR>. Set these secrets before first run
+  # (see .github/SECRETS.md).
+  write-env-file:
+    needs: resolve-env
+    runs-on: [self-hosted, macmini]
+    steps:
+      - name: Write env file from GHA secrets
+        env:
+          ENV: ${{ needs.resolve-env.outputs.environment }}
+          PUBLIC_URL: ${{ needs.resolve-env.outputs.public_url }}
+          # ── Slack MCP credentials ─────────────────────────────────────────
+          VAR_XOXP_TOKEN_DEV:           ${{ secrets.SLACK_MCP_SERVER_DEV_XOXP_TOKEN }}
+          VAR_XOXP_TOKEN_UAT:           ${{ secrets.SLACK_MCP_SERVER_UAT_XOXP_TOKEN }}
+          VAR_XOXP_TOKEN_PROD:          ${{ secrets.SLACK_MCP_SERVER_PROD_XOXP_TOKEN }}
+          VAR_XOXC_TOKEN_DEV:           ${{ secrets.SLACK_MCP_SERVER_DEV_XOXC_TOKEN }}
+          VAR_XOXC_TOKEN_UAT:           ${{ secrets.SLACK_MCP_SERVER_UAT_XOXC_TOKEN }}
+          VAR_XOXC_TOKEN_PROD:          ${{ secrets.SLACK_MCP_SERVER_PROD_XOXC_TOKEN }}
+          VAR_XOXD_TOKEN_DEV:           ${{ secrets.SLACK_MCP_SERVER_DEV_XOXD_TOKEN }}
+          VAR_XOXD_TOKEN_UAT:           ${{ secrets.SLACK_MCP_SERVER_UAT_XOXD_TOKEN }}
+          VAR_XOXD_TOKEN_PROD:          ${{ secrets.SLACK_MCP_SERVER_PROD_XOXD_TOKEN }}
+          # ── Tailscale ─────────────────────────────────────────────────────
+          VAR_TS_AUTHKEY_DEV:           ${{ secrets.SLACK_MCP_SERVER_DEV_TS_AUTHKEY }}
+          VAR_TS_AUTHKEY_UAT:           ${{ secrets.SLACK_MCP_SERVER_UAT_TS_AUTHKEY }}
+          VAR_TS_AUTHKEY_PROD:          ${{ secrets.SLACK_MCP_SERVER_PROD_TS_AUTHKEY }}
+          VAR_TS_API_KEY_DEV:           ${{ secrets.SLACK_MCP_SERVER_DEV_TS_API_KEY }}
+          VAR_TS_API_KEY_UAT:           ${{ secrets.SLACK_MCP_SERVER_UAT_TS_API_KEY }}
+          VAR_TS_API_KEY_PROD:          ${{ secrets.SLACK_MCP_SERVER_PROD_TS_API_KEY }}
+        run: |
+          # Select per-env values using the ENV variable
+          case "$ENV" in
+            prod)
+              XOXP_TOKEN="$VAR_XOXP_TOKEN_PROD"
+              XOXC_TOKEN="$VAR_XOXC_TOKEN_PROD"
+              XOXD_TOKEN="$VAR_XOXD_TOKEN_PROD"
+              TS_AUTHKEY="$VAR_TS_AUTHKEY_PROD"
+              TS_API_KEY="$VAR_TS_API_KEY_PROD"
+              ;;
+            uat)
+              XOXP_TOKEN="$VAR_XOXP_TOKEN_UAT"
+              XOXC_TOKEN="$VAR_XOXC_TOKEN_UAT"
+              XOXD_TOKEN="$VAR_XOXD_TOKEN_UAT"
+              TS_AUTHKEY="$VAR_TS_AUTHKEY_UAT"
+              TS_API_KEY="$VAR_TS_API_KEY_UAT"
+              ;;
+            *)
+              XOXP_TOKEN="$VAR_XOXP_TOKEN_DEV"
+              XOXC_TOKEN="$VAR_XOXC_TOKEN_DEV"
+              XOXD_TOKEN="$VAR_XOXD_TOKEN_DEV"
+              TS_AUTHKEY="$VAR_TS_AUTHKEY_DEV"
+              TS_API_KEY="$VAR_TS_API_KEY_DEV"
+              ;;
+          esac
+
+          # Mask secrets before they appear in any log line
+          echo "::add-mask::$XOXP_TOKEN"
+          echo "::add-mask::$XOXC_TOKEN"
+          echo "::add-mask::$XOXD_TOKEN"
+          echo "::add-mask::$TS_AUTHKEY"
+          echo "::add-mask::$TS_API_KEY"
+
+          printf '%s\n' \
+            "SLACK_MCP_XOXP_TOKEN=${XOXP_TOKEN}" \
+            "SLACK_MCP_XOXC_TOKEN=${XOXC_TOKEN}" \
+            "SLACK_MCP_XOXD_TOKEN=${XOXD_TOKEN}" \
+            "SLACK_MCP_PORT=13080" \
+            "SLACK_MCP_HOST=0.0.0.0" \
+            "PORT=13080" \
+            "APP_NAME=slack-mcp-server" \
+            "TS_AUTHKEY=${TS_AUTHKEY}" \
+            "TS_HOSTNAME=slack-mcp-server-${ENV}" \
+            "TS_TAGS=tag:container" \
+            "TS_API_KEY=${TS_API_KEY}" \
+            > /tmp/app-env-slack-mcp-server.env
+
+          echo "Wrote /tmp/app-env-slack-mcp-server.env ($(wc -l < /tmp/app-env-slack-mcp-server.env) lines)"
+
+  # ── DB wipe (dev only) ──────────────────────────────────────────────────────
+  # P1/P2: no database. Retained for P3 (token-bridge will need one).
+  # Skips gracefully if ADMIN_URL secret is absent.
+  db-wipe:
+    needs: resolve-env
+    if: needs.resolve-env.outputs.environment == 'dev'
+    runs-on: [self-hosted, macmini]
+    steps:
+      - name: Wipe slack_mcp schema in slack_mcp_server_dev
+        env:
+          ADMIN_DATABASE_URL: ${{ secrets.SLACK_MCP_SERVER_DEV_DATABASE_ADMIN_URL }}
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            echo "psql not found on runner — skipping db-wipe (P1: no DB yet)."
+            exit 0
+          fi
+          if [ -z "$ADMIN_DATABASE_URL" ]; then
+            echo "SLACK_MCP_SERVER_DEV_DATABASE_ADMIN_URL not set — skipping db-wipe (P1: no DB yet)."
+            exit 0
+          fi
+          echo "::add-mask::$ADMIN_DATABASE_URL"
+          if printf '%s' "$ADMIN_DATABASE_URL" | grep -q 'srv-captain--'; then
+            echo "ERROR: SLACK_MCP_SERVER_DEV_DATABASE_ADMIN_URL points at a"
+            echo "CapRover-internal hostname — use qwickapps-db-dev.taile324e7.ts.net:6432."
+            exit 1
+          fi
+          echo "Wiping slack_mcp schema in slack_mcp_server_dev..."
+          psql "$ADMIN_DATABASE_URL" \
+            -c "DROP SCHEMA IF EXISTS slack_mcp CASCADE;" \
+            -c "CREATE SCHEMA slack_mcp;"
+          echo "Schema wiped."
+
+  # ── DB clone (uat only) ─────────────────────────────────────────────────────
+  # P1/P2: no database. Retained for P3. Skips gracefully if secrets absent.
+  db-clone:
+    needs: resolve-env
+    if: needs.resolve-env.outputs.environment == 'uat'
+    runs-on: [self-hosted, macmini]
+    steps:
+      - name: Clone prod DB into UAT
+        env:
+          PROD_ADMIN_URL: ${{ secrets.SLACK_MCP_SERVER_PROD_DATABASE_ADMIN_URL }}
+          UAT_ADMIN_URL:  ${{ secrets.SLACK_MCP_SERVER_UAT_DATABASE_ADMIN_URL }}
+        run: |
+          if ! command -v psql >/dev/null 2>&1 || ! command -v pg_dump >/dev/null 2>&1; then
+            echo "psql/pg_dump not found on runner — skipping db-clone (P1: no DB yet)."
+            exit 0
+          fi
+          if [ -z "$PROD_ADMIN_URL" ] || [ -z "$UAT_ADMIN_URL" ]; then
+            echo "PROD_ADMIN_URL and/or UAT_ADMIN_URL not set — skipping db-clone (P1: no DB yet)."
+            exit 0
+          fi
+          echo "::add-mask::$PROD_ADMIN_URL"
+          echo "::add-mask::$UAT_ADMIN_URL"
+          if printf '%s\n%s\n' "$PROD_ADMIN_URL" "$UAT_ADMIN_URL" | grep -q 'srv-captain--'; then
+            echo "ERROR: Admin URL(s) point at CapRover-internal hostname — use Tailscale hosts."
+            exit 1
+          fi
+          echo "Dropping uat slack_mcp schema..."
+          psql "$UAT_ADMIN_URL" -c "DROP SCHEMA IF EXISTS slack_mcp CASCADE; CREATE SCHEMA slack_mcp;"
+          echo "Cloning prod slack_mcp schema + data to uat..."
+          pg_dump --schema=slack_mcp --no-owner --no-acl "$PROD_ADMIN_URL" | psql "$UAT_ADMIN_URL"
+          echo "DB clone complete."
+
+  # ── Deploy ──────────────────────────────────────────────────────────────────
+  deploy:
+    needs: [resolve-env, write-env-file, db-wipe, db-clone]
+    if: |
+      always() &&
+      needs.resolve-env.result == 'success' &&
+      needs.write-env-file.result == 'success' &&
+      (needs.db-wipe.result == 'success' || needs.db-wipe.result == 'skipped') &&
+      (needs.db-clone.result == 'success' || needs.db-clone.result == 'skipped')
+    uses: ./.github/workflows/deploy-app.yml
+    secrets: inherit
+    with:
+      app_name:          slack-mcp-server
+      environment:       ${{ needs.resolve-env.outputs.environment }}
+      dockerfile_path:   Dockerfile.qwickapps
+      package_json_path: package.json
+      workspace_packages: ""
+      container_port:    "13080"
+      health_path:       /sse
+      caprover_host:     ${{ needs.resolve-env.outputs.caprover_host }}
+      public_url:        ${{ needs.resolve-env.outputs.public_url }}
+      run_migrations:    "false"
+      run_e2e:           "false"
+      critical_subsystems: ""
+      warning_subsystems:  ""
+      prod_critical_subsystems: ""

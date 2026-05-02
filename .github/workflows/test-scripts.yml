@@ -1,0 +1,13 @@
+name: Pipeline scripts unit tests
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/test-scripts.yml'
+jobs:
+  test-deploy-traffic-light:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run deploy-traffic-light unit tests
+        run: bash .github/scripts/test-deploy-traffic-light.sh

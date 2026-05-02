@@ -1,0 +1,23 @@
+slack-mcp-server — QwickApps Fork
+===================================
+
+This repository is a downstream fork of korotovsky/slack-mcp-server.
+
+Original project:
+  https://github.com/korotovsky/slack-mcp-server
+  Author: Dmitriy Korotovskiy and contributors
+  License: MIT (see LICENSE)
+
+QwickApps additions (not covered by upstream MIT license — proprietary):
+  - Dockerfile.qwickapps
+  - entrypoint.qwickapps.sh
+  - .github/workflows/
+  - .github/scripts/
+  - cmd/token-bridge/ (future, P3)
+  - cmd/slack-mcp-multiplexer/ (future, P3)
+  - package.json (deploy tooling only)
+  - UPSTREAM.md
+  - NOTICE (this file)
+
+The upstream binary and all files not listed above remain under the MIT
+license from the original authors. See LICENSE for full terms.

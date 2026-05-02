@@ -1,0 +1,6 @@
+{
+  "name": "slack-mcp-server-deploy",
+  "version": "0.1.0",
+  "private": true,
+  "_comment": "This file exists ONLY for version-extraction compatibility with the qwickapps deploy-app.yml reusable workflow, which calls `node -p \"require('./package.json').version\"`. The slack-mcp-server is a Go binary — this is NOT a Node.js project. Bump version here when tagging a new release. Source of truth for the upstream binary version is UPSTREAM.md."
+}

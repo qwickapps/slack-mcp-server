@@ -296,3 +296,24 @@ tail -n 20 -f ~/Library/Logs/Claude/mcp*.log
 ## License
 
 Licensed under MIT - see [LICENSE](LICENSE) file. This is not an official Slack product.
+
+---
+
+## Fork Attribution (QwickApps)
+
+This repository is a downstream fork of
+[korotovsky/slack-mcp-server](https://github.com/korotovsky/slack-mcp-server) (MIT).
+
+QwickApps additions in this fork:
+- `Dockerfile.qwickapps` — deployment wrapper image (pulls upstream binary into qwickapps-base)
+- `entrypoint.qwickapps.sh` — canonical Tailscale entrypoint v1.2
+- `.github/` — CI/CD pipeline (CapRover blue-green deploy via GitHub Actions)
+- `UPSTREAM.md` — upstream version pin, sync cadence, deviation log
+- `NOTICE` — license boundary between upstream (MIT) and QwickApps additions (proprietary)
+
+Future additions (P3+):
+- `cmd/token-bridge/` — per-user Slack token management service
+- `cmd/slack-mcp-multiplexer/` — multi-tenant MCP multiplexer
+
+Upstream binary path: `/usr/local/bin/mcp-server`
+Upstream version pinned: `v1.2.3` (see `UPSTREAM.md` for digest and sync procedure)
