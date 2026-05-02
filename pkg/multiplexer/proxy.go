@@ -34,11 +34,11 @@ func ProxyHandler(reg *Registry, serviceKey string) http.Handler {
 			return
 		}
 
-		// Auth: constant-time compare to prevent timing attacks.
+		// Auth check first — extractTeamID is deferred until auth passes so we
+		// do not parse the URL for unauthenticated requests.
 		if !bearerTokenValid(r, serviceKey) {
 			ip := clientIPStr(r)
-			teamID := extractTeamID(r.URL.Path)
-			log.Printf("multiplexer: unauthorized team=%s ip=%s", teamID, ip)
+			log.Printf("multiplexer: unauthorized ip=%s", ip)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -70,6 +70,11 @@ func ProxyHandler(reg *Registry, serviceKey string) http.Handler {
 				writeJSONMsg(w, http.StatusNotFound, "unknown team")
 				return
 			}
+			if errors.Is(err, ErrCrashBackoff) {
+				log.Printf("multiplexer team=%s: crash backoff active", teamID)
+				http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			log.Printf("multiplexer team=%s: GetOrSpawn: %v", teamID, err)
 			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 			return
@@ -93,7 +98,9 @@ func ProxyHandler(reg *Registry, serviceKey string) http.Handler {
 		e.lastUsed = time.Now()
 
 		// Read one newline-terminated response line from child stdout.
-		respLine, err := readLine(e.stdout, 30*time.Second)
+		// We pass e.stdout directly; on timeout we close the pipe which
+		// unblocks any goroutine blocked on Scan (see readLine).
+		respLine, err := readLine(e, 30*time.Second)
 		if err != nil {
 			log.Printf("multiplexer team=%s: read from child: %v", teamID, err)
 			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
@@ -134,15 +141,21 @@ func extractTeamID(path string) string {
 	return parts[1]
 }
 
-// readLine reads one newline-terminated line from r, timing out after d.
-func readLine(r io.Reader, d time.Duration) (string, error) {
+// readLine reads one newline-terminated line from the entry's stdout pipe,
+// timing out after d.
+//
+// On timeout, stdout is closed so that the background scanner goroutine
+// unblocks immediately — closing the pipe causes bufio.Scanner.Scan to return
+// false, which lets the goroutine exit cleanly. The entry is also marked
+// crashed (via closing stdout) so subsequent requests trigger a fresh spawn.
+func readLine(e *entry, d time.Duration) (string, error) {
 	type result struct {
 		line string
 		err  error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		scanner := bufio.NewScanner(r)
+		scanner := bufio.NewScanner(e.stdout)
 		if scanner.Scan() {
 			ch <- result{line: scanner.Text()}
 		} else {
@@ -154,6 +167,10 @@ func readLine(r io.Reader, d time.Duration) (string, error) {
 	case r := <-ch:
 		return r.line, r.err
 	case <-time.After(d):
+		// Close the pipe to unblock the scanner goroutine above.
+		// This also causes the child's stdout to EOF, which watchChild will
+		// notice when cmd.Wait returns, recording a crash and setting backoff.
+		_ = e.stdout.Close()
 		return "", fmt.Errorf("timeout reading from child stdout after %s", d)
 	}
 }

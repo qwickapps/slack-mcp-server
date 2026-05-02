@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -19,7 +20,7 @@ const (
 	stateStarting childState = iota
 	stateRunning
 	stateIdle    // graceful shutdown in progress
-	stateCrashed // process exited unexpectedly; retry after backoff
+	stateCrashed // process exited unexpectedly; only used in /_status snapshots
 )
 
 func (s childState) String() string {
@@ -31,7 +32,7 @@ func (s childState) String() string {
 	case stateIdle:
 		return "idle"
 	case stateCrashed:
-		return "error"
+		return "crashed"
 	default:
 		return "unknown"
 	}
@@ -48,16 +49,26 @@ type entry struct {
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 
+	// done is closed by watchChild when the child process has fully exited.
+	// Teardown and waitRunning both select on this channel.
+	done chan struct{}
+
 	state           childState
 	pid             int // 0 when not running
 	lastUsed        time.Time
 	lastRefreshedAt time.Time // value of workspaces.last_refreshed_at at spawn time
+}
 
-	// crash backoff
-	crashCount  int
-	crashedAt   time.Time
+// crashRecord tracks backoff state for a crashed team.
+// Stored on Registry (not entry) so it survives the entry deletion on crash.
+type crashRecord struct {
+	count       int
 	nextRetryAt time.Time
 }
+
+// ErrCrashBackoff is returned by GetOrSpawn when the team's child has crashed
+// and the backoff window has not yet elapsed. Callers should return 503.
+var ErrCrashBackoff = fmt.Errorf("child in crash backoff")
 
 // EntrySnapshot is a read-only view of an entry used by the status handler.
 type EntrySnapshot struct {
@@ -100,6 +111,7 @@ type Registry struct {
 
 	mu      sync.RWMutex
 	entries map[string]*entry
+	crashes map[string]crashRecord // keyed by teamID, guarded by mu
 }
 
 // NewRegistry constructs a Registry with the given config and reader.
@@ -121,6 +133,7 @@ func NewRegistry(reader WorkspaceReader, cfg RegistryConfig) *Registry {
 		cfg:     cfg,
 		reader:  reader,
 		entries: make(map[string]*entry),
+		crashes: make(map[string]crashRecord),
 	}
 }
 
@@ -137,18 +150,46 @@ func getenvDefault(k, def string) string {
 // process if none exists.
 //
 // On first call for a team the function:
-//  1. Looks up workspace credentials from the DB (GetWorkspace).
-//  2. Decrypts the xoxc/xoxd tokens.
-//  3. Starts the child process.
-//  4. Transitions state to RUNNING.
+//  1. Checks the crash backoff map; returns ErrCrashBackoff if still cooling.
+//  2. Looks up workspace credentials from the DB (GetWorkspace).
+//  3. Decrypts the xoxc/xoxd tokens.
+//  4. Starts the child process.
+//  5. Transitions state to RUNNING.
 //
 // Concurrent first-calls for the same team are safe: the first goroutine
 // inserts the entry under Registry.mu and sets state to STARTING; subsequent
 // goroutines find the entry in STARTING state and wait (with timeout) for it
 // to become RUNNING.
 func (reg *Registry) GetOrSpawn(ctx context.Context, teamID string) (*entry, error) {
+	// Check crash backoff before any other work.
+	reg.mu.RLock()
+	cr, hasCrash := reg.crashes[teamID]
+	reg.mu.RUnlock()
+	if hasCrash && time.Now().Before(cr.nextRetryAt) {
+		return nil, ErrCrashBackoff
+	}
+
 	// Fast path: entry already running.
-	if e := reg.getEntry(teamID); e != nil {
+	// If the entry is in stateIdle (transient teardown), retry briefly so the
+	// caller is not spuriously rejected while the old entry is being reaped.
+	const maxIdleRetries = 5
+	for i := 0; i < maxIdleRetries; i++ {
+		e := reg.getEntry(teamID)
+		if e == nil {
+			break
+		}
+		e.mu.Lock()
+		s := e.state
+		e.mu.Unlock()
+		if s == stateIdle {
+			// Entry is shutting down; wait briefly then retry the map lookup.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+			continue
+		}
 		if err := reg.waitRunning(ctx, e); err != nil {
 			return nil, err
 		}
@@ -156,7 +197,7 @@ func (reg *Registry) GetOrSpawn(ctx context.Context, teamID string) (*entry, err
 	}
 
 	// Slow path: insert a new entry and spawn.
-	e := &entry{teamID: teamID, state: stateStarting}
+	e := &entry{teamID: teamID, state: stateStarting, done: make(chan struct{})}
 	e.mu.Lock() // hold entry lock before making it visible
 
 	reg.mu.Lock()
@@ -197,11 +238,16 @@ func (reg *Registry) getEntry(teamID string) *entry {
 // waitRunning blocks until e.state == stateRunning or the context is done.
 // Returns an error if the entry ends up in a non-running state, or if the
 // context is cancelled.
+//
+// Rather than poll-spinning, it selects on e.done (signalled when the child
+// exits) with a 50 ms fallback tick, so it wakes promptly on exit events
+// while still catching the STARTING→RUNNING transition.
 func (reg *Registry) waitRunning(ctx context.Context, e *entry) error {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		e.mu.Lock()
 		state := e.state
+		done := e.done
 		e.mu.Unlock()
 
 		switch state {
@@ -220,6 +266,8 @@ func (reg *Registry) waitRunning(ctx context.Context, e *entry) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-done:
+			// Child exited while we were waiting; re-check state next iteration.
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
@@ -228,11 +276,6 @@ func (reg *Registry) waitRunning(ctx context.Context, e *entry) error {
 // spawnLocked launches the child process for e.
 // Caller must hold e.mu.
 func (reg *Registry) spawnLocked(ctx context.Context, e *entry) error {
-	// Check crash backoff.
-	if e.state == stateCrashed && time.Now().Before(e.nextRetryAt) {
-		return fmt.Errorf("child %s in backoff until %s", e.teamID, e.nextRetryAt.Format(time.RFC3339))
-	}
-
 	ws, err := reg.reader.GetWorkspace(ctx, e.teamID)
 	if err != nil {
 		return fmt.Errorf("get workspace %s: %w", e.teamID, err)
@@ -289,7 +332,11 @@ func (reg *Registry) spawnLocked(ctx context.Context, e *entry) error {
 	e.pid = cmd.Process.Pid
 	e.lastUsed = time.Now()
 	e.lastRefreshedAt = ws.LastRefreshedAt
-	e.crashCount = 0
+
+	// On a successful spawn, clear any prior crash record.
+	reg.mu.Lock()
+	delete(reg.crashes, e.teamID)
+	reg.mu.Unlock()
 
 	// Watch for unexpected exit.
 	go reg.watchChild(e)
@@ -298,7 +345,10 @@ func (reg *Registry) spawnLocked(ctx context.Context, e *entry) error {
 }
 
 // watchChild waits for the child to exit and updates entry state.
+// It closes e.done as its last action, which unblocks Teardown and waitRunning.
 func (reg *Registry) watchChild(e *entry) {
+	defer close(e.done)
+
 	err := e.cmd.Wait()
 
 	e.mu.Lock()
@@ -313,19 +363,19 @@ func (reg *Registry) watchChild(e *entry) {
 		return
 	}
 
-	// Unexpected crash.
-	e.crashCount++
-	e.crashedAt = time.Now()
-	backoff := reg.crashBackoff(e.crashCount)
-	e.nextRetryAt = e.crashedAt.Add(backoff)
+	// Unexpected crash: record backoff in the Registry so it survives entry deletion.
+	reg.mu.Lock()
+	cr := reg.crashes[e.teamID]
+	cr.count++
+	backoff := reg.crashBackoff(cr.count)
+	cr.nextRetryAt = time.Now().Add(backoff)
+	reg.crashes[e.teamID] = cr
+	delete(reg.entries, e.teamID)
+	reg.mu.Unlock()
+
 	e.state = stateCrashed
 	e.pid = 0
 	log.Printf("multiplexer: child crashed team=%s err=%v retry in %s", e.teamID, err, backoff)
-
-	// Remove from registry so the next request triggers a fresh spawn attempt.
-	reg.mu.Lock()
-	delete(reg.entries, e.teamID)
-	reg.mu.Unlock()
 }
 
 // crashBackoff returns the backoff duration for the nth crash.
@@ -343,30 +393,33 @@ func (reg *Registry) crashBackoff(n int) time.Duration {
 
 // Teardown sends SIGTERM to the child and waits up to 2 seconds before
 // SIGKILLing. It acquires e.mu.
+//
+// It does NOT call cmd.Wait — that is done exclusively by watchChild.
+// Instead it waits on e.done, which watchChild closes after Wait returns.
 func (reg *Registry) Teardown(e *entry) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	if e.state != stateRunning {
+		e.mu.Unlock()
 		return
 	}
 	e.state = stateIdle
+	done := e.done
 
 	log.Printf("multiplexer: idle teardown team=%s", e.teamID)
-	_ = e.cmd.Process.Signal(os.Interrupt) // SIGINT on all platforms in tests
-	done := make(chan struct{})
-	go func() {
-		_ = e.cmd.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		_ = e.cmd.Process.Kill()
-		<-done
-	}
+	_ = e.cmd.Process.Signal(syscall.SIGTERM)
 	_ = e.stdin.Close()
 	e.pid = 0
+	e.mu.Unlock()
+
+	// Wait for watchChild to call cmd.Wait and close done.
+	select {
+	case <-done:
+		// graceful exit
+	case <-time.After(2 * time.Second):
+		_ = e.cmd.Process.Kill()
+		<-done // wait for watchChild to finish after kill
+	}
 
 	reg.mu.Lock()
 	delete(reg.entries, e.teamID)
@@ -458,7 +511,7 @@ func (reg *Registry) pollRefresh(ctx context.Context) {
 	}
 }
 
-// ShutdownAll sends SIGTERM/SIGKILL to all running children.
+// ShutdownAll sends SIGTERM (with SIGKILL fallback) to all running children.
 // Called by the main server during graceful shutdown.
 func (reg *Registry) ShutdownAll() {
 	reg.mu.RLock()
@@ -501,12 +554,19 @@ func (e *entry) Send(frame []byte) error {
 }
 
 // prefixWriter is an io.Writer that prepends a fixed prefix to each Write call.
-// Used to prefix child stderr output with [mux team=<team_id>].
+// It splits the input on newlines and emits one log line per non-empty line,
+// preventing multi-line stderr output from being logged as a single entry.
+// Used to prefix child stderr with [mux team=<team_id>].
 type prefixWriter struct {
 	prefix string
 }
 
 func (pw *prefixWriter) Write(p []byte) (int, error) {
-	log.Printf("%s%s", pw.prefix, p)
+	lines := strings.Split(string(p), "\n")
+	for _, line := range lines {
+		if line != "" {
+			log.Printf("%s%s", pw.prefix, line)
+		}
+	}
 	return len(p), nil
 }

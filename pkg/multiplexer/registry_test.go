@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -186,6 +187,7 @@ func TestConcurrentFirstRequest(t *testing.T) {
 func TestIdleTeardown(t *testing.T) {
 	reader := newFakeReader(ws("T003"))
 	reg := makeRegistry(reader)
+	defer reg.ShutdownAll()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -216,11 +218,14 @@ func TestIdleTeardown(t *testing.T) {
 	t.Error("entry was not swept after idle timeout")
 }
 
-// TestCrashBackoff verifies that a child crash removes the entry from the
-// registry and sets a backoff on the entry.
+// TestCrashBackoff verifies that:
+//  1. A child crash removes the entry from the registry.
+//  2. An immediate retry returns ErrCrashBackoff (503-equivalent).
+//  3. After the backoff window expires, GetOrSpawn succeeds again.
 func TestCrashBackoff(t *testing.T) {
 	reader := newFakeReader(ws("T004"))
 	reg := makeRegistry(reader)
+	defer reg.ShutdownAll()
 
 	ctx := context.Background()
 	e, err := reg.GetOrSpawn(ctx, "T004")
@@ -228,27 +233,52 @@ func TestCrashBackoff(t *testing.T) {
 		t.Fatalf("GetOrSpawn: %v", err)
 	}
 
-	// Kill the child abruptly, simulating a crash.
+	// Capture the done channel before killing; kill the child abruptly.
 	e.mu.Lock()
-	pid := e.pid
-	_ = pid
 	proc := e.cmd.Process
+	done := e.done
 	e.mu.Unlock()
 
 	_ = proc.Kill()
 
-	// watchChild runs in a goroutine; give it time to process the exit.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		reg.mu.RLock()
-		_, still := reg.entries["T004"]
-		reg.mu.RUnlock()
-		if !still {
-			return // entry removed after crash
-		}
-		time.Sleep(50 * time.Millisecond)
+	// Wait for watchChild to process the exit and delete the entry.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchChild did not finish within 2s")
 	}
-	t.Error("entry not removed from registry after crash")
+
+	// Give watchChild time to update the crashes map (it runs after Wait).
+	time.Sleep(10 * time.Millisecond)
+
+	// Verify entry was removed from the registry.
+	reg.mu.RLock()
+	_, still := reg.entries["T004"]
+	reg.mu.RUnlock()
+	if still {
+		t.Fatal("entry should have been removed after crash")
+	}
+
+	// Immediate retry must be blocked by crash backoff.
+	_, err = reg.GetOrSpawn(ctx, "T004")
+	if !errors.Is(err, ErrCrashBackoff) {
+		t.Fatalf("expected ErrCrashBackoff immediately after crash, got: %v", err)
+	}
+
+	// CrashBackoffBase is 50ms in makeRegistry; wait just past that.
+	time.Sleep(70 * time.Millisecond)
+
+	// After backoff expires, GetOrSpawn should succeed.
+	e2, err := reg.GetOrSpawn(ctx, "T004")
+	if err != nil {
+		t.Fatalf("GetOrSpawn after backoff: %v", err)
+	}
+	e2.mu.Lock()
+	state := e2.state
+	e2.mu.Unlock()
+	if state != stateRunning {
+		t.Errorf("expected running after backoff, got %v", state)
+	}
 }
 
 // TestTokenRefreshRecycles verifies that the refresh poller tears down a child
