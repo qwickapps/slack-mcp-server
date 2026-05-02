@@ -21,11 +21,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// requireEnv skips the test if the named environment variable is unset or empty.
+// Integration tests depend on real third-party credentials that are not available
+// in PR CI. Skipping (rather than failing) keeps the workflow green for
+// contributors while allowing scheduled jobs and local runs with real secrets to
+// exercise the full path.
+func requireEnv(t *testing.T, key string) string {
+	t.Helper()
+	val := os.Getenv(key)
+	if val == "" {
+		t.Skipf("integration: %s not set; skipping", key)
+	}
+	return val
+}
+
 func TestIntegrationConversations(t *testing.T) {
+	apiKey := requireEnv(t, "SLACK_MCP_OPENAI_API")
+	requireEnv(t, "SLACK_MCP_XOXP_TOKEN")
+	requireEnv(t, "NGROK_AUTH_TOKEN")
+
 	sseKey := uuid.New().String()
 	require.NotEmpty(t, sseKey, "sseKey must be generated for integration tests")
-	apiKey := os.Getenv("SLACK_MCP_OPENAI_API")
-	require.NotEmpty(t, apiKey, "SLACK_MCP_OPENAI_API must be set for integration tests")
 
 	cfg := util.MCPConfig{
 		SSEKey:             sseKey,
