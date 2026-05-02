@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -212,19 +213,29 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 // clientIP extracts the requester's IP for audit purposes. We trust
 // X-Forwarded-For only as the leftmost entry (CapRover/Caddy add it on
-// our edge); otherwise fall back to RemoteAddr.
+// our edge); otherwise fall back to RemoteAddr. Returns "" if the parsed
+// value is not a valid IP — audit_log.source_ip is `inet`, which would
+// reject malformed strings outright.
 func clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		head := xff
 		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
+			head = xff[:i]
 		}
-		return strings.TrimSpace(xff)
+		head = strings.TrimSpace(head)
+		if net.ParseIP(head) != nil {
+			return head
+		}
+		return ""
 	}
-	addr := r.RemoteAddr
-	if i := strings.LastIndexByte(addr, ':'); i >= 0 {
-		return addr[:i]
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
 	}
-	return addr
+	if net.ParseIP(host) != nil {
+		return host
+	}
+	return ""
 }
 
 // Compile-time guard: *Store must satisfy WorkspaceStore.
