@@ -31,6 +31,12 @@ type matchingRule struct {
 func setupTestEnv(t *testing.T) (*testEnv, func()) {
 	t.Helper()
 
+	// Integration tests require real Slack + ngrok credentials which are not
+	// available in PR CI. Skip cleanly when they are absent so contributors are
+	// not blocked. requireEnv is defined in conversations_test.go (same package).
+	requireEnv(t, "SLACK_MCP_XOXP_TOKEN")
+	requireEnv(t, "NGROK_AUTH_TOKEN")
+
 	sseKey := uuid.New().String()
 	require.NotEmpty(t, sseKey, "sseKey must be generated for integration tests")
 
