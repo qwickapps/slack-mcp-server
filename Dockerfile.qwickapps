@@ -28,6 +28,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/token-bridge ./cmd/token-bridge
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/multiplexer ./cmd/multiplexer
 
 # qwickapps-base ships node + curl + tailscale + ca-certificates (see qwickapps/node Dockerfile).
 # If a future base rebuild drops these, the build below will fail loudly — that is the desired failure mode.
@@ -39,8 +40,12 @@ USER root
 COPY --from=upstream /usr/local/bin/mcp-server /usr/local/bin/mcp-server
 
 # QwickApps token-bridge sidecar (see cmd/token-bridge). Selected via CMD
-# override at the CapRover-app level — this image ships both binaries.
+# override at the CapRover-app level — this image ships all three binaries.
 COPY --from=builder /out/token-bridge /usr/local/bin/token-bridge
+
+# QwickApps multiplexer (see cmd/multiplexer). Fronts per-team mcp-server
+# children; selected via CMD override at the CapRover-app level.
+COPY --from=builder /out/multiplexer /usr/local/bin/multiplexer
 
 # SQL migrations applied by token-bridge on startup.
 COPY --from=builder /src/migrations /app/migrations
