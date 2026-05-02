@@ -405,7 +405,7 @@ qwickapps/mcp plugin  →  POST /teams/{team_id}/mcp  →  cmd/multiplexer
 **Tests:**
 ```sh
 # Unit + integration (fake child, all non-DB tests run without Postgres):
-go test ./pkg/multiplexer/... -short -timeout 30s
+go test ./pkg/multiplexer/... -timeout 30s
 
 # Integration tests (DBReader, real DB):
 TEST_DATABASE_URL=postgres://... go test ./pkg/multiplexer/... -timeout 60s
