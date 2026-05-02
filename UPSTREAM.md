@@ -44,3 +44,4 @@ authoritative record of divergence for future sync reviewers.
 | 2026-04-29 | `package.json` | Added (new file) | Version extraction shim for deploy-app.yml reusable workflow |
 | 2026-04-29 | `NOTICE` | Added (new file) | Attribution and license boundary |
 | 2026-04-29 | `UPSTREAM.md` | Added (new file) | This file |
+| 2026-04-29 | `Dockerfile.qwickapps` | Pinned `qwickapps-base` by digest `sha256:ecad995099c1dc8f1ad690be6ddb7cb0ad3d415cd948810170cf259e171c89b2` | Unpinned `:latest` risks silent base-image regressions. Re-pin manually when the base is rebuilt; cadence should match upstream sync (see above). |

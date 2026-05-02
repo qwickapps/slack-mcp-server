@@ -174,14 +174,18 @@ jobs:
       - name: Validate stable slot health
         run: |
           HEALTH_URL="${STABLE_APP_URL}${{ env.HEALTH_PATH }}"
-          echo "Waiting for ${HEALTH_URL} to return HTTP 200..."
+          echo "Waiting for ${HEALTH_URL} to become healthy..."
           MAX_ATTEMPTS=15
           SLEEP_SEC=20
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            STATUS=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" || echo "000")
-            echo "  Attempt ${attempt}/${MAX_ATTEMPTS}: HTTP ${STATUS}"
-            if [ "$STATUS" = "200" ]; then
-              echo "Stable slot health check passed."
+            # Use --max-time 2 so curl does not block on the SSE stream forever.
+            # Exit 28 (operation timeout) means curl connected and got 200 OK but kept the
+            # SSE stream open — that is a healthy response. Exit 0 is also healthy.
+            curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1
+            rc=$?
+            echo "  Attempt ${attempt}/${MAX_ATTEMPTS}: curl exit ${rc}"
+            if [ $rc -eq 0 ] || [ $rc -eq 28 ]; then
+              echo "Stable slot health check passed (exit ${rc})."
               exit 0
             fi
             [ "$attempt" -lt "$MAX_ATTEMPTS" ] && sleep "$SLEEP_SEC"

@@ -4,7 +4,7 @@ name: Deploy App (Reusable)
 # Handles: build → provision-app → provision-gateway → deploy-and-verify → traffic-light-swap → cleanup.
 #
 # Callers pass app-specific inputs; all secrets are inherited via `secrets: inherit`.
-# Shared by faabzi, work-macha, and future products.
+# Vendored from qwickapps/slack pipeline. Caller: deploy.yml.
 #
 # Required GitHub secrets (set per repo):
 #   OCI_DEV_CAPROVER_URL          — https://captain.dev.qwickforge.com
@@ -47,15 +47,15 @@ on:
         default: 'schema,logging,auth,react-framework,auth-client,cms,server'
 
       container_port:
-        description: 'Container port the app listens on'
+        description: 'Container port the app listens on. REQUIRED — pass explicitly from caller.'
         type: string
-        default: '3300'
+        default: ''
 
       # ── Health ────────────────────────────────────────────────────────────────
       health_path:
-        description: 'Health check endpoint (must start with /). Use /_health to avoid Payload CMS /api/* interception.'
+        description: 'Health check endpoint, must start with /. REQUIRED — pass explicitly from caller.'
         type: string
-        default: '/_health'
+        default: ''
 
       # ── CapRover ──────────────────────────────────────────────────────────────
       caprover_host:
@@ -119,6 +119,12 @@ jobs:
       gateway_app_name: ${{ steps.urls.outputs.gateway_app_name }}
       live_app_url:     ${{ steps.urls.outputs.live_app_url }}
     steps:
+      - name: Validate required inputs
+        run: |
+          [ -n "${{ inputs.container_port }}" ] || { echo "ERROR: container_port is required"; exit 1; }
+          [ -n "${{ inputs.health_path }}" ] || { echo "ERROR: health_path is required"; exit 1; }
+          case "${{ inputs.health_path }}" in /*) ;; *) echo "ERROR: health_path must start with /"; exit 1 ;; esac
+
       - name: Checkout code
         uses: actions/checkout@v4
 
