@@ -305,15 +305,51 @@ This repository is a downstream fork of
 [korotovsky/slack-mcp-server](https://github.com/korotovsky/slack-mcp-server) (MIT).
 
 QwickApps additions in this fork:
-- `Dockerfile.qwickapps` — deployment wrapper image (pulls upstream binary into qwickapps-base)
+- `Dockerfile.qwickapps` — deployment wrapper image (ships both upstream `mcp-server` and our `token-bridge` binaries)
 - `entrypoint.qwickapps.sh` — canonical Tailscale entrypoint v1.2
 - `.github/` — CI/CD pipeline (CapRover blue-green deploy via GitHub Actions)
+- `cmd/token-bridge/` — sidecar for xoxc/xoxd token storage (P2)
+- `pkg/tokenbridge/` — crypto, HMAC, store, handler internals
+- `migrations/` — hand-rolled SQL applied by token-bridge on startup
 - `UPSTREAM.md` — upstream version pin, sync cadence, deviation log
 - `NOTICE` — license boundary between upstream (MIT) and QwickApps additions (proprietary)
 
 Future additions (P3+):
-- `cmd/token-bridge/` — per-user Slack token management service
 - `cmd/slack-mcp-multiplexer/` — multi-tenant MCP multiplexer
 
 Upstream binary path: `/usr/local/bin/mcp-server`
 Upstream version pinned: `v1.2.3` (see `UPSTREAM.md` for digest and sync procedure)
+
+### Token Bridge
+
+`cmd/token-bridge` is a sidecar HTTP service that ingests xoxc/xoxd Slack web-client
+tokens captured by a Tampermonkey userscript (P4) and stores them encrypted at rest.
+The multiplexer (P3) reads from the same DB to spawn per-team upstream `mcp-server`
+children.
+
+**Endpoints:**
+- `POST /api/tokens/refresh` — HMAC-authed (`X-Bridge-Signature` over raw body using
+  `BRIDGE_HMAC_KEY`; `X-Bridge-Nonce` must equal body's `nonce` field). 5-minute
+  replay window on `captured_at`. Idempotent by `(team_id, captured_at)`: equal or
+  older timestamps return `{stored: false, reason: "stale"}`.
+- `GET /_health` — 200 if DB ping succeeds, 503 otherwise.
+
+**Environment variables:**
+- `DATABASE_URL` — postgres connection string (required)
+- `TOKEN_ENCRYPTION_KEY` — base64-encoded 32-byte AES-256-GCM key (required); generate with
+  `openssl rand -base64 32`
+- `BRIDGE_HMAC_KEY` — shared secret with the userscript (required)
+- `TOKEN_BRIDGE_PORT` — listen port (default `13081`)
+- `TOKEN_BRIDGE_HOST` — listen host (default `0.0.0.0`)
+
+**Storage:** xoxc and xoxd are stored separately as `bytea`, each prefixed with the
+12-byte AES-GCM nonce. Schema in `migrations/0001_init.sql` (workspaces + audit_log).
+
+**Tests:**
+```sh
+# Unit tests (crypto, hmac, handler with fake store):
+go test ./pkg/tokenbridge/... -short
+
+# Integration tests (store, real DB):
+TEST_DATABASE_URL=postgres://... go test ./pkg/tokenbridge/...
+```
