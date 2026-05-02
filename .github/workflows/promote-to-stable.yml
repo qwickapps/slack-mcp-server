@@ -1,0 +1,230 @@
+# qwickapps/slack-mcp-server — manual promote-to-stable for the blue-green pipeline.
+# Re-tags an image as stable-<version>-<sha> in GHCR and deploys to the stable slot.
+
+name: Promote slack-mcp-server to Stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: |
+          Full GHCR image reference to tag as stable and deploy.
+          Use the SAME image_ref that was promoted to live.
+          Example: ghcr.io/qwickapps/img-slack-mcp-server-prod:1.0.0.42
+        required: true
+        type: string
+      environment:
+        description: 'Target environment for stable slot'
+        required: true
+        type: choice
+        options: [prod, uat]
+        default: prod
+
+concurrency:
+  group: slack-mcp-server-promote-stable-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: slack-mcp-server
+  OWNER: qwickapps
+  HEALTH_PATH: /sse
+
+jobs:
+  promote-to-stable:
+    runs-on: [self-hosted, macmini]
+    steps:
+      - name: Validate image_ref input
+        run: |
+          IMAGE_REF="${{ inputs.image_ref }}"
+          if [ -z "$IMAGE_REF" ]; then
+            echo "ERROR: image_ref input is required."
+            exit 1
+          fi
+          if ! echo "$IMAGE_REF" | grep -q 'ghcr.io/qwickapps/img-slack-mcp-server-'; then
+            echo "ERROR: image_ref does not look like a slack-mcp-server GHCR image."
+            echo "  Got: $IMAGE_REF"
+            echo "  Expected format: ghcr.io/qwickapps/img-slack-mcp-server-{prod|uat}:<tag>"
+            exit 1
+          fi
+          # Extract version tag (e.g. "1.0.0.42") from image_ref
+          VERSION_TAG=$(echo "$IMAGE_REF" | sed 's/.*://')
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          STABLE_TAG="stable-${VERSION_TAG}-${SHORT_SHA}"
+
+          echo "image_ref=${IMAGE_REF}"     >> "$GITHUB_ENV"
+          echo "VERSION_TAG=${VERSION_TAG}" >> "$GITHUB_ENV"
+          echo "STABLE_TAG=${STABLE_TAG}"   >> "$GITHUB_ENV"
+          echo "Stable tag will be: ${STABLE_TAG}"
+
+      - name: Resolve CapRover credentials and slot names
+        run: |
+          ENV="${{ inputs.environment }}"
+
+          case "$ENV" in
+            prod)
+              STABLE_APP="${{ env.APP_NAME }}-stable"
+              CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
+              CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
+              STABLE_APP_URL="https://${{ env.APP_NAME }}-stable.app.qwickforge.com"
+              # Derive the base image name from prod image_ref for re-tagging
+              BASE_IMAGE_NAME="ghcr.io/${{ env.OWNER }}/img-${{ env.APP_NAME }}-prod"
+              ;;
+            uat)
+              STABLE_APP="${{ env.APP_NAME }}-uat-stable"
+              CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
+              CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
+              STABLE_APP_URL="https://${{ env.APP_NAME }}-uat-stable.app.qwickforge.com"
+              BASE_IMAGE_NAME="ghcr.io/${{ env.OWNER }}/img-${{ env.APP_NAME }}-uat"
+              ;;
+          esac
+
+          echo "::add-mask::$CAPROVER_PASSWORD"
+          echo "::add-mask::${{ secrets.GHCR_PUSH_TOKEN }}"
+          echo "::add-mask::${{ secrets.GHCR_PULL_TOKEN }}"
+
+          echo "STABLE_APP=${STABLE_APP}"               >> "$GITHUB_ENV"
+          echo "CAPROVER_URL=${CAPROVER_URL}"           >> "$GITHUB_ENV"
+          echo "CAPROVER_PASSWORD=${CAPROVER_PASSWORD}" >> "$GITHUB_ENV"
+          echo "STABLE_APP_URL=${STABLE_APP_URL}"       >> "$GITHUB_ENV"
+          echo "BASE_IMAGE_NAME=${BASE_IMAGE_NAME}"     >> "$GITHUB_ENV"
+          echo "GHCR_PUSH_TOKEN=${{ secrets.GHCR_PUSH_TOKEN }}" >> "$GITHUB_ENV"
+          echo "GHCR_PULL_TOKEN=${{ secrets.GHCR_PULL_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Tag image as stable in GHCR
+        run: |
+          # Login to GHCR (macOS self-hosted: write credentials directly, no keychain)
+          TMPDIR_DOCKER="$(mktemp -d)"
+          AUTH_B64=$(printf '%s:%s' "${{ github.actor }}" "${GHCR_PUSH_TOKEN}" | base64 | tr -d '\n')
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$AUTH_B64" > "$TMPDIR_DOCKER/config.json"
+          export DOCKER_CONFIG="$TMPDIR_DOCKER"
+
+          # Pull the source image (already built and in GHCR)
+          echo "Pulling ${image_ref}..."
+          docker --config "$TMPDIR_DOCKER" pull "${image_ref}"
+
+          # Tag as stable-<version>-<short_sha>
+          STABLE_IMAGE_VERSIONED="${BASE_IMAGE_NAME}:${STABLE_TAG}"
+          docker --config "$TMPDIR_DOCKER" tag "${image_ref}" "${STABLE_IMAGE_VERSIONED}"
+          docker --config "$TMPDIR_DOCKER" push "${STABLE_IMAGE_VERSIONED}"
+          echo "Pushed: ${STABLE_IMAGE_VERSIONED}"
+
+          # Also tag as stable-latest (mutable, only for operator convenience in rollbacks)
+          STABLE_IMAGE_LATEST="${BASE_IMAGE_NAME}:stable-latest"
+          docker --config "$TMPDIR_DOCKER" tag "${image_ref}" "${STABLE_IMAGE_LATEST}"
+          docker --config "$TMPDIR_DOCKER" push "${STABLE_IMAGE_LATEST}"
+          echo "Pushed: ${STABLE_IMAGE_LATEST}"
+
+          echo "STABLE_IMAGE_VERSIONED=${STABLE_IMAGE_VERSIONED}" >> "$GITHUB_ENV"
+
+          # Clean up temp config
+          rm -rf "$TMPDIR_DOCKER"
+
+      - name: Obtain CapRover auth token
+        run: |
+          TOKEN=$(curl -sf -X POST "${CAPROVER_URL}/api/v2/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"password\":\"${CAPROVER_PASSWORD}\"}" \
+            | tr -d '\n' \
+            | sed 's/.*"token":"\([^"]*\)".*/\1/')
+
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to obtain CapRover token"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "CAPROVER_TOKEN=${TOKEN}" >> "$GITHUB_ENV"
+
+      - name: Ensure stable slot exists on CapRover
+        run: |
+          EXISTS=$(curl -sf "${CAPROVER_URL}/api/v2/user/apps/appDefinitions" \
+            -H "x-captain-auth: ${CAPROVER_TOKEN}" \
+            -H "x-namespace: captain" \
+            | tr -d '\n' \
+            | grep -o "\"appName\":\"${STABLE_APP}\"" || true)
+
+          if [ -z "$EXISTS" ]; then
+            echo "Creating stable slot '${STABLE_APP}' on CapRover..."
+            curl -sf -X POST "${CAPROVER_URL}/api/v2/user/apps/appDefinitions/register" \
+              -H "Content-Type: application/json" \
+              -H "x-captain-auth: ${CAPROVER_TOKEN}" \
+              -H "x-namespace: captain" \
+              -d "{\"appName\":\"${STABLE_APP}\",\"hasPersistentData\":false}"
+            echo "Stable slot created."
+          else
+            echo "Stable slot '${STABLE_APP}' already exists."
+          fi
+
+      - name: Deploy versioned stable image to stable slot
+        run: |
+          echo "Deploying ${STABLE_IMAGE_VERSIONED} to ${STABLE_APP}..."
+
+          curl -sf -X POST "${CAPROVER_URL}/api/v2/user/apps/appDefinitions/update" \
+            -H "Content-Type: application/json" \
+            -H "x-captain-auth: ${CAPROVER_TOKEN}" \
+            -H "x-namespace: captain" \
+            -d "{
+              \"appName\": \"${STABLE_APP}\",
+              \"instanceCount\": 1,
+              \"captainDefinitionContent\": \"{\\\"schemaVersion\\\":2,\\\"imageName\\\":\\\"${STABLE_IMAGE_VERSIONED}\\\"}\",
+              \"registryAuthHeader\": \"$(printf '%s:%s' '${{ github.actor }}' "${GHCR_PULL_TOKEN}" | base64 | tr -d '\n')\"
+            }" || true
+
+          echo "Deploy triggered."
+
+      - name: Validate stable slot health
+        run: |
+          HEALTH_URL="${STABLE_APP_URL}${{ env.HEALTH_PATH }}"
+          echo "Waiting for ${HEALTH_URL} to return HTTP 200..."
+          MAX_ATTEMPTS=15
+          SLEEP_SEC=20
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            STATUS=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" || echo "000")
+            echo "  Attempt ${attempt}/${MAX_ATTEMPTS}: HTTP ${STATUS}"
+            if [ "$STATUS" = "200" ]; then
+              echo "Stable slot health check passed."
+              exit 0
+            fi
+            [ "$attempt" -lt "$MAX_ATTEMPTS" ] && sleep "$SLEEP_SEC"
+          done
+          echo "ERROR: Stable slot health check failed after ${MAX_ATTEMPTS} attempts."
+          echo "The stable image was tagged and pushed to GHCR but the slot may not be healthy."
+          echo "Investigate before marking this image as stable rollback target."
+          exit 1
+
+      - name: Notify via Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          STATUS="${{ job.status }}"
+          ENV="${{ inputs.environment }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="[OK]"
+            printf -v MSG '%s\n\n%s\n%s\n%s\n%s\n\n%s' \
+              "${EMOJI} slack-mcp-server promoted to STABLE (${ENV})" \
+              "Source image: ${image_ref}" \
+              "Stable image: ${STABLE_IMAGE_VERSIONED}" \
+              "Stable URL:   ${STABLE_APP_URL}" \
+              "Run: ${RUN_URL}" \
+              "This image is now the rollback target for ${ENV}."
+          else
+            EMOJI="[FAIL]"
+            printf -v MSG '%s\n\n%s\n%s\n%s\n\n%s' \
+              "${EMOJI} slack-mcp-server promote-to-stable FAILED (${ENV})" \
+              "Source image: ${image_ref}" \
+              "Stable tag attempted: ${STABLE_TAG}" \
+              "Run: ${RUN_URL}" \
+              "The live slot remains the last known-good. Check logs."
+          fi
+
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}" \
+              || echo "WARN: Telegram notification failed (non-fatal)"
+          else
+            echo "WARN: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — skipping notification"
+          fi

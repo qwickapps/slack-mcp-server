@@ -1,0 +1,705 @@
+name: Deploy App (Reusable)
+
+# Reusable workflow: full blue-green traffic-light deployment pipeline for a qwickapps product.
+# Handles: build → provision-app → provision-gateway → deploy-and-verify → traffic-light-swap → cleanup.
+#
+# Callers pass app-specific inputs; all secrets are inherited via `secrets: inherit`.
+# Shared by faabzi, work-macha, and future products.
+#
+# Required GitHub secrets (set per repo):
+#   OCI_DEV_CAPROVER_URL          — https://captain.dev.qwickforge.com
+#   OCI_DEV_CAPROVER_PASSWORD     — dev CapRover password
+#   OCI_MAIN_CAPROVER_URL         — https://captain.app.qwickforge.com
+#   OCI_MAIN_CAPROVER_PASSWORD    — prod CapRover password
+#   OCI_GATEWAY_CAPROVER_URL      — gateway CapRover URL
+#   OCI_GATEWAY_CAPROVER_PASSWORD — gateway CapRover password
+#   GHCR_PUSH_TOKEN               — GHCR push token
+#   GHCR_PULL_TOKEN               — GHCR pull token
+
+on:
+  workflow_call:
+    inputs:
+      # ── Identity ──────────────────────────────────────────────────────────────
+      app_name:
+        description: 'Product/app slug (e.g. faabzi, work-macha)'
+        type: string
+        required: true
+
+      environment:
+        description: 'Target environment: dev | uat | prod'
+        type: string
+        required: true
+
+      # ── Build ─────────────────────────────────────────────────────────────────
+      dockerfile_path:
+        description: 'Path to Dockerfile from repo root (e.g. clients/faabzi/Dockerfile)'
+        type: string
+        required: true
+
+      package_json_path:
+        description: 'Path to package.json for version extraction (e.g. clients/faabzi/package.json)'
+        type: string
+        required: true
+
+      workspace_packages:
+        description: 'Comma-separated workspace packages to build before docker build'
+        type: string
+        default: 'schema,logging,auth,react-framework,auth-client,cms,server'
+
+      container_port:
+        description: 'Container port the app listens on'
+        type: string
+        default: '3300'
+
+      # ── Health ────────────────────────────────────────────────────────────────
+      health_path:
+        description: 'Health check endpoint (must start with /). Use /_health to avoid Payload CMS /api/* interception.'
+        type: string
+        default: '/_health'
+
+      # ── CapRover ──────────────────────────────────────────────────────────────
+      caprover_host:
+        description: 'CapRover hostname for URL fallback (e.g. captain.dev.qwickforge.com)'
+        type: string
+        required: true
+
+      # ── Public URLs ───────────────────────────────────────────────────────────
+      public_url:
+        description: 'Public-facing URL for this environment (e.g. https://dev.faabzi.com)'
+        type: string
+        required: true
+
+      # ── Misc ──────────────────────────────────────────────────────────────────
+      run_migrations:
+        description: 'Whether to run DB migrations during traffic-light deploy'
+        type: string
+        default: 'false'
+
+      run_e2e:
+        description: 'Whether to run E2E smoke tests after build deploy'
+        type: string
+        default: 'false'
+
+      smoke_test_path:
+        description: 'API path to hit for a basic smoke test after health check (e.g. /qapi/api/globals/site-settings). Leave empty to skip.'
+        type: string
+        default: ''
+
+      # ── Subsystem Health Classification ───────────────────────────────────────
+      critical_subsystems:
+        description: 'Comma-separated subsystem names that MUST be healthy for deploy to proceed (e.g. postgres,payload-cms-service). If empty, all subsystems are treated as critical.'
+        type: string
+        default: 'postgres'
+
+      warning_subsystems:
+        description: 'Comma-separated subsystem names that are checked but non-blocking (e.g. auth-supertokens). Unhealthy warnings are logged but do not fail the deploy.'
+        type: string
+        default: ''
+
+      prod_critical_subsystems:
+        description: 'Comma-separated subsystem names that are warnings in dev/uat but MUST be healthy in prod/uat (e.g. auth-supertokens). These are merged into critical_subsystems when environment != dev.'
+        type: string
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: qwickapps
+
+jobs:
+  # ── Phase 0: Compute metadata ────────────────────────────────────────────────
+  prepare:
+    runs-on: [self-hosted, macmini]
+    outputs:
+      image_ref:        ${{ steps.meta.outputs.image_ref }}
+      tag:              ${{ steps.meta.outputs.tag }}
+      build_app:        ${{ steps.meta.outputs.build_app }}
+      live_app:         ${{ steps.meta.outputs.live_app }}
+      stable_app:       ${{ steps.meta.outputs.stable_app }}
+      app_url:          ${{ steps.urls.outputs.app_url }}
+      gateway_app_name: ${{ steps.urls.outputs.gateway_app_name }}
+      live_app_url:     ${{ steps.urls.outputs.live_app_url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          VERSION=$(node -p "require('./${{ inputs.package_json_path }}').version")
+          TAG="${VERSION}.${{ github.run_number }}"
+          ENV="${{ inputs.environment }}"
+          APP="${{ inputs.app_name }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/img-${APP}-${ENV}:${TAG}"
+
+          case "$ENV" in
+            prod)
+              BUILD_APP="${APP}-build"
+              LIVE_APP="${APP}-live"
+              STABLE_APP="${APP}-stable"
+              ;;
+            uat)
+              BUILD_APP="${APP}-uat-build"
+              LIVE_APP="${APP}-uat"
+              STABLE_APP="${APP}-uat-stable"
+              ;;
+            *)
+              # dev: single-slot environment — build IS the live slot.
+              # See: https://github.com/qwickapps/slack/issues/20
+              BUILD_APP="${APP}"
+              LIVE_APP="${APP}"
+              STABLE_APP=""
+              ;;
+          esac
+
+          echo "image_ref=${IMAGE}"         >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"                 >> "$GITHUB_OUTPUT"
+          echo "build_app=${BUILD_APP}"     >> "$GITHUB_OUTPUT"
+          echo "live_app=${LIVE_APP}"       >> "$GITHUB_OUTPUT"
+          echo "stable_app=${STABLE_APP}"   >> "$GITHUB_OUTPUT"
+
+      - name: Derive URLs
+        id: urls
+        run: |
+          ENV="${{ inputs.environment }}"
+          APP="${{ inputs.app_name }}"
+          BUILD_APP="${{ steps.meta.outputs.build_app }}"
+          LIVE_APP="${{ steps.meta.outputs.live_app }}"
+
+          case "$ENV" in
+            prod)
+              APP_URL="https://${BUILD_APP}.app.qwickforge.com"
+              GATEWAY_APP_NAME="${APP}"
+              LIVE_APP_URL="https://${LIVE_APP}.app.qwickforge.com"
+              ;;
+            uat)
+              APP_URL="https://${BUILD_APP}.app.qwickforge.com"
+              GATEWAY_APP_NAME="${APP}-uat"
+              LIVE_APP_URL="https://${LIVE_APP}.app.qwickforge.com"
+              ;;
+            *)
+              # dev: single-slot — live URL == build URL. See issue #20.
+              APP_URL="https://${BUILD_APP}.dev.qwickforge.com"
+              GATEWAY_APP_NAME="${APP}-dev"
+              LIVE_APP_URL="${APP_URL}"
+              ;;
+          esac
+
+          echo "app_url=${APP_URL}"                   >> "$GITHUB_OUTPUT"
+          echo "gateway_app_name=${GATEWAY_APP_NAME}" >> "$GITHUB_OUTPUT"
+          echo "live_app_url=${LIVE_APP_URL}"         >> "$GITHUB_OUTPUT"
+
+  # ── Phase 1: Build & push Docker image ───────────────────────────────────────
+  build:
+    needs: prepare
+    runs-on: [self-hosted, macmini]
+    # GHCR push uses GHCR_PUSH_TOKEN PAT (see "Login to GHCR" step) — we don't
+    # need elevated GITHUB_TOKEN packages:write, which the qwickapps org policy
+    # disables at the workflow-defaults level.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        run: |
+          corepack enable
+          corepack install
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile --store-dir .pnpm-store
+
+      # Standalone repos pass workspace_packages='' to skip the monorepo-only build step.
+      - name: Build workspace packages
+        if: inputs.workspace_packages != ''
+        run: |
+          CLIENT_DIR="$(dirname '${{ inputs.dockerfile_path }}')"
+          .github/scripts/build-workspace-package.sh \
+            --product "${CLIENT_DIR}" \
+            --packages "${{ inputs.workspace_packages }}"
+
+      - name: Ensure Docker endpoint
+        run: |
+          chmod +x .github/scripts/resolve-docker-endpoint.sh
+          .github/scripts/resolve-docker-endpoint.sh
+
+      - name: Login to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          # macOS self-hosted runner: bypass docker login to avoid keychain issues.
+          # Write base64-encoded credentials directly into a temp config.json with
+          # no credsStore entry. Docker reads the auths map directly for auth.
+          TMPDIR_DOCKER="$(mktemp -d)"
+          AUTH_B64=$(printf '%s:%s' "${{ github.actor }}" "$GHCR_TOKEN" | base64 | tr -d '\n')
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$AUTH_B64" > "$TMPDIR_DOCKER/config.json"
+          export DOCKER_CONFIG="$TMPDIR_DOCKER"
+          echo "DOCKER_CONFIG=$TMPDIR_DOCKER" >> "$GITHUB_ENV"
+          echo "GHCR credentials written to $TMPDIR_DOCKER/config.json (no docker login, no keychain)"
+
+      - name: Clean up stale buildx builders
+        run: |
+          docker ps -a --filter name=buildx_buildkit_ --format '{{.Names}}' | xargs -r docker rm -f 2>/dev/null || true
+          docker buildx rm --all-inactive --force 2>/dev/null || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile_path }}
+          push: true
+          platforms: linux/arm64
+          tags: |
+            ${{ needs.prepare.outputs.image_ref }}
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/img-${{ inputs.app_name }}-${{ inputs.environment }}:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Rotate build cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  # ── Phase 1.5 (parallel with build): Provision CapRover app ──────────────────
+  # NOTE: This job expects an env file at /tmp/app-env-<app_name>.env written by
+  # the *caller* workflow in a preceding step. For faabzi this is done via the
+  # SOPS decrypt step in deploy-faabzi.yml. If no env file is present the job
+  # skips env update and just ensures the app exists.
+  provision-app:
+    needs: [prepare, build]
+    runs-on: [self-hosted, macmini]
+    concurrency:
+      group: caprover-provision-${{ inputs.app_name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve CapRover credentials
+        run: |
+          ENV="${{ inputs.environment }}"
+          if [ "$ENV" = "dev" ]; then
+            CP_URL="${{ secrets.OCI_DEV_CAPROVER_URL }}"
+            CP_PASS="${{ secrets.OCI_DEV_CAPROVER_PASSWORD }}"
+          else
+            CP_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
+            CP_PASS="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
+          fi
+
+          if [ -z "$CP_URL" ] || [ "$CP_URL" = "null" ]; then
+            CP_URL="https://${{ inputs.caprover_host }}"
+          fi
+
+          if [ -z "$CP_URL" ] || [ -z "$CP_PASS" ]; then
+            echo "ERROR: CapRover credentials not found."
+            echo "  Set OCI_DEV_CAPROVER_URL + OCI_DEV_CAPROVER_PASSWORD (dev)"
+            echo "   or OCI_MAIN_CAPROVER_URL + OCI_MAIN_CAPROVER_PASSWORD (uat/prod)"
+            exit 1
+          fi
+
+          echo "::add-mask::$CP_PASS"
+          echo "CAPROVER_URL=$CP_URL"       >> "$GITHUB_ENV"
+          echo "CAPROVER_PASSWORD=$CP_PASS" >> "$GITHUB_ENV"
+
+      - name: Make scripts executable
+        run: chmod +x .github/scripts/*.sh
+
+      - name: Configure build slot on CapRover
+        run: |
+          ENV_FILE="/tmp/app-env-${{ inputs.app_name }}.env"
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "INFO: $ENV_FILE not found — app will keep its existing env vars"
+            # Minimal file so configure script does not fail
+            printf 'NODE_ENV=production\n' > "$ENV_FILE"
+          fi
+          .github/scripts/configure-caprover-app.sh \
+            --app-name         "${{ needs.prepare.outputs.build_app }}" \
+            --caprover-url     "$CAPROVER_URL" \
+            --caprover-password "$CAPROVER_PASSWORD" \
+            --container-port   "${{ inputs.container_port }}" \
+            --env-file         "$ENV_FILE"
+
+  # ── Phase 1.5 (parallel with build): Provision gateway route ─────────────────
+  provision-gateway:
+    needs: [prepare, build]
+    runs-on: [self-hosted, macmini]
+    continue-on-error: true
+    concurrency:
+      group: caprover-provision-gateway-${{ inputs.app_name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve gateway credentials
+        run: |
+          GW_URL="${{ secrets.OCI_GATEWAY_CAPROVER_URL }}"
+          GW_PASS="${{ secrets.OCI_GATEWAY_CAPROVER_PASSWORD }}"
+          GHCR_PULL="${{ secrets.GHCR_PULL_TOKEN }}"
+
+          echo "::add-mask::$GW_PASS"
+          echo "::add-mask::$GHCR_PULL"
+
+          echo "ROUTE_CAPROVER_URL=$GW_URL"       >> "$GITHUB_ENV"
+          echo "ROUTE_CAPROVER_PASSWORD=$GW_PASS" >> "$GITHUB_ENV"
+          echo "GHCR_PULL_TOKEN=$GHCR_PULL"       >> "$GITHUB_ENV"
+
+      - name: Make scripts executable
+        run: chmod +x .github/scripts/*.sh
+
+      - name: Provision QwickWay route
+        run: |
+          .github/scripts/setup-qwickway-route.sh \
+            --gateway-app-name "${{ needs.prepare.outputs.gateway_app_name }}" \
+            --target-app-url   "${{ needs.prepare.outputs.live_app_url }}" \
+            --route-caprover-url      "$ROUTE_CAPROVER_URL" \
+            --route-caprover-password "$ROUTE_CAPROVER_PASSWORD" \
+            --health-check-path "${{ inputs.health_path }}" \
+            --github-token "$GHCR_PULL_TOKEN" \
+            --github-owner "${{ env.OWNER }}"
+
+  # ── Phase 2: Deploy image to build slot & verify health ──────────────────────
+  deploy-and-verify:
+    needs: [prepare, build, provision-app, provision-gateway]
+    if: |
+      needs.prepare.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.provision-app.result == 'success' &&
+      (needs.provision-gateway.result == 'success' || needs.provision-gateway.result == 'skipped')
+    runs-on: [self-hosted, macmini]
+    concurrency:
+      group: caprover-deploy-${{ inputs.app_name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve CapRover credentials
+        run: |
+          ENV="${{ inputs.environment }}"
+          if [ "$ENV" = "dev" ]; then
+            CP_URL="${{ secrets.OCI_DEV_CAPROVER_URL }}"
+            CP_PASS="${{ secrets.OCI_DEV_CAPROVER_PASSWORD }}"
+          else
+            CP_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
+            CP_PASS="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
+          fi
+
+          if [ -z "$CP_URL" ] || [ "$CP_URL" = "null" ]; then
+            CP_URL="https://${{ inputs.caprover_host }}"
+          fi
+
+          echo "::add-mask::$CP_PASS"
+          echo "CAPROVER_URL=$CP_URL"       >> "$GITHUB_ENV"
+          echo "CAPROVER_PASSWORD=$CP_PASS" >> "$GITHUB_ENV"
+          echo "GHCR_PULL_TOKEN=${{ secrets.GHCR_PULL_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Make scripts executable
+        run: chmod +x .github/scripts/*.sh
+
+      - name: Ensure app exists on CapRover
+        run: |
+          # Login to CapRover and capture token
+          TOKEN=$(curl -sf -X POST "${CAPROVER_URL}/api/v2/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"password\":\"${CAPROVER_PASSWORD}\"}" \
+            | tr -d '\n' \
+            | sed 's/.*"token":"\([^"]*\)".*/\1/')
+
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to obtain CapRover token"
+            exit 1
+          fi
+
+          BUILD_APP="${{ needs.prepare.outputs.build_app }}"
+
+          # Check if app already exists
+          EXISTS=$(curl -sf "${CAPROVER_URL}/api/v2/user/apps/appDefinitions" \
+            -H "x-captain-auth: ${TOKEN}" \
+            -H "x-namespace: captain" \
+            | tr -d '\n' \
+            | grep -o "\"appName\":\"${BUILD_APP}\"" || true)
+
+          if [ -z "$EXISTS" ]; then
+            echo "App '${BUILD_APP}' not found on CapRover - creating it now..."
+            RESULT=$(curl -sf -X POST "${CAPROVER_URL}/api/v2/user/apps/appDefinitions/register" \
+              -H "Content-Type: application/json" \
+              -H "x-captain-auth: ${TOKEN}" \
+              -H "x-namespace: captain" \
+              -d "{\"appName\":\"${BUILD_APP}\",\"hasPersistentData\":false}")
+            echo "Create result: $RESULT"
+          else
+            echo "App '${BUILD_APP}' already exists - skipping creation."
+          fi
+
+      - name: Deploy from GHCR to build slot
+        run: |
+          .github/scripts/deploy-from-ghcr.sh \
+            --app-name          "${{ needs.prepare.outputs.build_app }}" \
+            --image-ref         "${{ needs.prepare.outputs.image_ref }}" \
+            --caprover-url      "$CAPROVER_URL" \
+            --caprover-password "$CAPROVER_PASSWORD" \
+            --github-token      "$GHCR_PULL_TOKEN" \
+            --github-owner      "${{ env.OWNER }}"
+
+      - name: Validate build slot health
+        run: |
+          # Next.js + Payload CMS can take 3-4 min to start after a fresh image pull.
+          # The CapRover deploy API call itself often 504s after 2 min (async pull continues).
+          # 15 attempts x 20s = 300s gives enough runway for image pull + container start.
+          .github/scripts/validate-deployment-health.sh \
+            --app-name          "${{ needs.prepare.outputs.build_app }}" \
+            --caprover-url      "$CAPROVER_URL" \
+            --caprover-password "$CAPROVER_PASSWORD" \
+            --app-url           "${{ needs.prepare.outputs.app_url }}" \
+            --health-path       "${{ inputs.health_path }}" \
+            --max-attempts      15 \
+            --sleep             20
+
+      - name: Deep health check (subsystem validation)
+        run: |
+          # After the basic HTTP 200 check passes, run a deep health check that
+          # parses the JSON response and validates each subsystem.
+          # Critical subsystems block promotion; warning subsystems only log.
+          #
+          # Environment-aware classification:
+          #   prod_critical_subsystems are warnings in dev but critical in prod/uat.
+          #   In dev:      kept in WARNING list (non-blocking).
+          #   In uat/prod: merged into CRITICAL list (deploy fails if unhealthy).
+          ENV="${{ inputs.environment }}"
+          EFFECTIVE_CRITICAL="${{ inputs.critical_subsystems }}"
+          EFFECTIVE_WARNING="${{ inputs.warning_subsystems }}"
+          PROD_CRITICAL="${{ inputs.prod_critical_subsystems }}"
+
+          if [ -n "$PROD_CRITICAL" ] && [ "$ENV" != "dev" ]; then
+            # Promote prod_critical_subsystems into the critical list for uat/prod
+            if [ -n "$EFFECTIVE_CRITICAL" ]; then
+              EFFECTIVE_CRITICAL="${EFFECTIVE_CRITICAL},${PROD_CRITICAL}"
+            else
+              EFFECTIVE_CRITICAL="${PROD_CRITICAL}"
+            fi
+            # Remove from warning list if present (avoid duplicate classification)
+            EFFECTIVE_WARNING=$(echo "$EFFECTIVE_WARNING" | tr ',' '\n' |               while IFS= read -r item; do
+                trimmed=$(echo "$item" | xargs)
+                if echo "$PROD_CRITICAL" | tr ',' '\n' | xargs -I{} sh -c 'test "$1" = "$2"' _ {} "$trimmed" 2>/dev/null; then
+                  : # skip — now critical
+                else
+                  [ -n "$trimmed" ] && echo "$trimmed"
+                fi
+              done | paste -sd ',')
+            echo "ENV=$ENV: promoting prod_critical_subsystems ($PROD_CRITICAL) to CRITICAL"
+          elif [ -n "$PROD_CRITICAL" ] && [ "$ENV" = "dev" ]; then
+            # In dev: treat prod_critical_subsystems as warnings (non-blocking)
+            if [ -n "$EFFECTIVE_WARNING" ]; then
+              EFFECTIVE_WARNING="${EFFECTIVE_WARNING},${PROD_CRITICAL}"
+            else
+              EFFECTIVE_WARNING="${PROD_CRITICAL}"
+            fi
+            echo "ENV=dev: treating prod_critical_subsystems ($PROD_CRITICAL) as WARNING (non-blocking)"
+          fi
+
+          DEEP_ARGS=(
+            --url "${{ needs.prepare.outputs.app_url }}${{ inputs.health_path }}"
+            --timeout 15
+            --max-attempts 3
+            --sleep 10
+          )
+          if [ -n "$EFFECTIVE_CRITICAL" ]; then
+            DEEP_ARGS+=(--critical-subsystems "$EFFECTIVE_CRITICAL")
+          fi
+          if [ -n "$EFFECTIVE_WARNING" ]; then
+            DEEP_ARGS+=(--warning-subsystems "$EFFECTIVE_WARNING")
+          fi
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            DEEP_ARGS+=(--summary-file "$GITHUB_STEP_SUMMARY")
+          fi
+          .github/scripts/deep-health-check.sh "${DEEP_ARGS[@]}"
+
+      - name: API smoke test
+        if: inputs.smoke_test_path != ''
+        run: |
+          # Basic API smoke test: verify the endpoint returns HTTP 200 after
+          # the structured health check passes. This catches cases where the
+          # health subsystems are green but a critical route is broken (e.g.
+          # missing Payload globals, misconfigured middleware).
+          SMOKE_URL="${{ needs.prepare.outputs.app_url }}${{ inputs.smoke_test_path }}"
+          echo "Smoke test: GET $SMOKE_URL"
+          MAX=3
+          for attempt in $(seq 1 $MAX); do
+            STATUS=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 15 "$SMOKE_URL" || echo "000")
+            echo "  Attempt $attempt: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "  [OK] Smoke test passed"
+              exit 0
+            fi
+            [ "$attempt" -lt "$MAX" ] && sleep 10
+          done
+          echo "  [FAIL] Smoke test failed — $SMOKE_URL returned HTTP $STATUS after $MAX attempts"
+          exit 1
+
+  # ── Phase 3: Traffic-light swap (build → live, live → stable) ────────────────
+  traffic-light-deploy:
+    needs: [prepare, build, provision-app, provision-gateway, deploy-and-verify]
+    if: |
+      needs.prepare.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.provision-app.result == 'success' &&
+      needs.deploy-and-verify.result == 'success'
+    runs-on: [self-hosted, macmini]
+    concurrency:
+      group: caprover-traffic-light-${{ inputs.app_name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve CapRover credentials
+        run: |
+          ENV="${{ inputs.environment }}"
+          if [ "$ENV" = "dev" ]; then
+            CP_URL="${{ secrets.OCI_DEV_CAPROVER_URL }}"
+            CP_PASS="${{ secrets.OCI_DEV_CAPROVER_PASSWORD }}"
+          else
+            CP_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
+            CP_PASS="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
+          fi
+
+          if [ -z "$CP_URL" ] || [ "$CP_URL" = "null" ]; then
+            CP_URL="https://${{ inputs.caprover_host }}"
+          fi
+
+          GW_URL="${{ secrets.OCI_GATEWAY_CAPROVER_URL }}"
+          GW_PASS="${{ secrets.OCI_GATEWAY_CAPROVER_PASSWORD }}"
+
+          echo "::add-mask::$CP_PASS"
+          echo "::add-mask::$GW_PASS"
+          echo "CAPROVER_URL=$CP_URL"             >> "$GITHUB_ENV"
+          echo "CAPROVER_PASSWORD=$CP_PASS"       >> "$GITHUB_ENV"
+          echo "ROUTE_CAPROVER_URL=$GW_URL"       >> "$GITHUB_ENV"
+          echo "ROUTE_CAPROVER_PASSWORD=$GW_PASS" >> "$GITHUB_ENV"
+          echo "GHCR_PULL_TOKEN=${{ secrets.GHCR_PULL_TOKEN }}" >> "$GITHUB_ENV"
+
+      - name: Make scripts executable
+        run: chmod +x .github/scripts/*.sh
+
+      # Issue #11: deploy-traffic-light.sh runs `pnpm playwright test` from the
+      # repo root when run_e2e=true. Standalone repos (e.g. qwickapps/slack)
+      # check out fresh in this job and have no node_modules, so pnpm cannot
+      # find the playwright binary. Install deps before running E2E. Mirrors
+      # the setup pattern used by the build job above.
+      - name: Setup Node.js
+        if: inputs.run_e2e == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        if: inputs.run_e2e == 'true'
+        run: |
+          corepack enable
+          corepack install
+          pnpm --version
+
+      - name: Install dependencies for E2E
+        if: inputs.run_e2e == 'true'
+        run: pnpm install --no-frozen-lockfile --store-dir .pnpm-store
+
+      - name: Run traffic-light deployment
+        run: |
+          # Compute effective subsystem classification (same env-aware logic as deep health check step)
+          ENV="${{ inputs.environment }}"
+          EFFECTIVE_CRITICAL="${{ inputs.critical_subsystems }}"
+          EFFECTIVE_WARNING="${{ inputs.warning_subsystems }}"
+          PROD_CRITICAL="${{ inputs.prod_critical_subsystems }}"
+
+          if [ -n "$PROD_CRITICAL" ] && [ "$ENV" != "dev" ]; then
+            if [ -n "$EFFECTIVE_CRITICAL" ]; then
+              EFFECTIVE_CRITICAL="${EFFECTIVE_CRITICAL},${PROD_CRITICAL}"
+            else
+              EFFECTIVE_CRITICAL="${PROD_CRITICAL}"
+            fi
+            EFFECTIVE_WARNING=$(echo "$EFFECTIVE_WARNING" | tr ',' '\n' |               while IFS= read -r item; do
+                trimmed=$(echo "$item" | xargs)
+                if echo "$PROD_CRITICAL" | tr ',' '\n' | xargs -I{} sh -c 'test "$1" = "$2"' _ {} "$trimmed" 2>/dev/null; then
+                  :
+                else
+                  [ -n "$trimmed" ] && echo "$trimmed"
+                fi
+              done | paste -sd ',')
+          elif [ -n "$PROD_CRITICAL" ] && [ "$ENV" = "dev" ]; then
+            if [ -n "$EFFECTIVE_WARNING" ]; then
+              EFFECTIVE_WARNING="${EFFECTIVE_WARNING},${PROD_CRITICAL}"
+            else
+              EFFECTIVE_WARNING="${PROD_CRITICAL}"
+            fi
+          fi
+
+          .github/scripts/deploy-traffic-light.sh \
+            --product           "${{ inputs.app_name }}" \
+            --environment       "${{ inputs.environment }}" \
+            --image-ref         "${{ needs.prepare.outputs.image_ref }}" \
+            --caprover-url        "$CAPROVER_URL" \
+            --caprover-password   "$CAPROVER_PASSWORD" \
+            --route-caprover-url  "$ROUTE_CAPROVER_URL" \
+            --route-caprover-password "$ROUTE_CAPROVER_PASSWORD" \
+            --github-token        "$GHCR_PULL_TOKEN" \
+            --github-owner        "${{ env.OWNER }}" \
+            --health-path         "${{ inputs.health_path }}" \
+            --run-migrations      "${{ inputs.run_migrations }}" \
+            --run-e2e             "${{ inputs.run_e2e }}" \
+            --critical-subsystems "$EFFECTIVE_CRITICAL" \
+            --warning-subsystems  "$EFFECTIVE_WARNING"
+
+      - name: Point gateway at live slot
+        run: |
+          .github/scripts/setup-qwickway-route.sh \
+            --gateway-app-name "${{ needs.prepare.outputs.gateway_app_name }}" \
+            --target-app-url   "${{ needs.prepare.outputs.live_app_url }}" \
+            --route-caprover-url      "$ROUTE_CAPROVER_URL" \
+            --route-caprover-password "$ROUTE_CAPROVER_PASSWORD" \
+            --health-check-path "${{ inputs.health_path }}" \
+            --github-token      "$GHCR_PULL_TOKEN" \
+            --github-owner      "${{ env.OWNER }}"
+
+  # ── Phase 4: Clean up old dev builds ─────────────────────────────────────────
+  cleanup-dev:
+    needs: [prepare, traffic-light-deploy]
+    runs-on: [self-hosted, macmini]
+    if: always() && inputs.environment == 'dev' && needs.prepare.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve credentials
+        run: |
+          CP_PASS="${{ secrets.OCI_DEV_CAPROVER_PASSWORD }}"
+          GW_PASS="${{ secrets.OCI_GATEWAY_CAPROVER_PASSWORD }}"
+          echo "::add-mask::$CP_PASS"
+          echo "::add-mask::$GW_PASS"
+          echo "OCI_DEV_CAPROVER_URL=${{ secrets.OCI_DEV_CAPROVER_URL }}"       >> "$GITHUB_ENV"
+          echo "OCI_DEV_CAPROVER_PASSWORD=$CP_PASS"                             >> "$GITHUB_ENV"
+          echo "ROUTE_CAPROVER_URL=${{ secrets.OCI_GATEWAY_CAPROVER_URL }}"     >> "$GITHUB_ENV"
+          echo "ROUTE_CAPROVER_PASSWORD=$GW_PASS"                               >> "$GITHUB_ENV"
+
+      - name: Make scripts executable
+        run: chmod +x .github/scripts/*.sh
+
+      - name: Clean up old dev builds
+        run: |
+          .github/scripts/cleanup-dev-builds.sh \
+            --app-name-prefix   "${{ inputs.app_name }}" \
+            --caprover-url      "$OCI_DEV_CAPROVER_URL" \
+            --caprover-password "$OCI_DEV_CAPROVER_PASSWORD" \
+            --route-caprover-url      "$ROUTE_CAPROVER_URL" \
+            --route-caprover-password "$ROUTE_CAPROVER_PASSWORD" \
+            --gateway-app-name  "${{ inputs.app_name }}-dev" \
+            --dev-domain-suffix "dev.qwickforge.com"
