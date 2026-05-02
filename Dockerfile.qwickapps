@@ -65,12 +65,17 @@ ENV PORT=13080 \
     SLACK_MCP_HOST=0.0.0.0
 
 EXPOSE 13080
+# 13082 is the multiplexer's HTTP listen port (MULTIPLEXER_PORT env var).
+EXPOSE 13082
 
 # entrypoint.sh sets up Tailscale + Tailscale Serve, then exec's CMD.
 ENTRYPOINT ["/app/entrypoint.sh"]
 
-# Phase 1: run upstream binary directly.
-# P3 will replace this CMD with the multiplexer (cmd/slack-mcp-multiplexer).
+# Default CMD runs the upstream mcp-server binary in SSE mode.
+# CapRover deployments override CMD per-app to select the desired binary:
+#   - upstream mcp-server (SSE, single-tenant): CMD ["/usr/local/bin/mcp-server", "--transport", "sse"]
+#   - token-bridge sidecar:                     CMD ["/usr/local/bin/token-bridge"]
+#   - multiplexer (multi-tenant, P3):           CMD ["/usr/local/bin/multiplexer"]
 CMD ["/usr/local/bin/mcp-server", "--transport", "sse"]
 
 # The SSE endpoint at /sse is the liveness indicator for the MCP server.
