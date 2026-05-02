@@ -305,17 +305,16 @@ This repository is a downstream fork of
 [korotovsky/slack-mcp-server](https://github.com/korotovsky/slack-mcp-server) (MIT).
 
 QwickApps additions in this fork:
-- `Dockerfile.qwickapps` — deployment wrapper image (ships both upstream `mcp-server` and our `token-bridge` binaries)
+- `Dockerfile.qwickapps` — deployment wrapper image (ships upstream `mcp-server`, `token-bridge`, and `multiplexer` binaries)
 - `entrypoint.qwickapps.sh` — canonical Tailscale entrypoint v1.2
 - `.github/` — CI/CD pipeline (CapRover blue-green deploy via GitHub Actions)
 - `cmd/token-bridge/` — sidecar for xoxc/xoxd token storage (P2)
+- `cmd/multiplexer/` — per-team MCP child router (P3)
 - `pkg/tokenbridge/` — crypto, HMAC, store, handler internals
+- `pkg/multiplexer/` — registry, proxy handler, health/status handlers
 - `migrations/` — hand-rolled SQL applied by token-bridge on startup
 - `UPSTREAM.md` — upstream version pin, sync cadence, deviation log
 - `NOTICE` — license boundary between upstream (MIT) and QwickApps additions (proprietary)
-
-Future additions (P3+):
-- `cmd/slack-mcp-multiplexer/` — multi-tenant MCP multiplexer
 
 Upstream binary path: `/usr/local/bin/mcp-server`
 Upstream version pinned: `v1.2.3` (see `UPSTREAM.md` for digest and sync procedure)
@@ -352,4 +351,62 @@ go test ./pkg/tokenbridge/... -short
 
 # Integration tests (store, real DB):
 TEST_DATABASE_URL=postgres://... go test ./pkg/tokenbridge/...
+```
+
+### Multiplexer
+
+`cmd/multiplexer` is an HTTP service (port 13082, Tailscale-only) that presents
+one MCP endpoint per team to the aggregator (qwickapps/mcp) and, behind the
+scenes, routes each request to the correct per-team `mcp-server` child process.
+Each child is lazily spawned on the first request using decrypted xoxc/xoxd
+credentials read from the token-bridge DB.
+
+**Request flow:**
+
+```
+qwickapps/mcp plugin  →  POST /teams/{team_id}/mcp  →  cmd/multiplexer
+                                                              │
+                                                  registry.GetOrSpawn
+                                                              │
+                                                  per-team mcp-server (stdio)
+                                                              │
+                                                          api.slack.com
+```
+
+**Endpoints:**
+- `POST /teams/{team_id}/mcp` — bearer-authed (`Authorization: Bearer <MULTIPLEXER_SERVICE_KEY>`).
+  Request body is an opaque MCP JSON-RPC frame relayed to the child via stdin;
+  response is the child's stdout line written back to the caller.
+- `GET /_health` — 200 `{"status":"ok"}` when DB ping succeeds; 503 otherwise.
+- `GET /_status` — bearer-authed; returns per-team child state and PID:
+  `{"teams":[{"team_id":"...","state":"running","pid":1234}]}`.
+
+**Child lifecycle:**
+- **Lazy spawn** — child started on first request for a team. No pre-spawn at startup.
+- **Idle reap** — background sweeper terminates children idle for longer than
+  `MULTIPLEXER_IDLE_TIMEOUT` (default 10 min).
+- **Token refresh** — background poller detects `last_refreshed_at` advances in
+  the DB every `MULTIPLEXER_POLL_INTERVAL` (default 30 s) and recycles stale children.
+- **Crash backoff** — crashed children are retried with exponential backoff
+  (30 s → 60 s → 120 s → capped at 300 s).
+
+**Environment variables:**
+- `DATABASE_URL` — postgres connection string (required; shared with token-bridge)
+- `TOKEN_ENCRYPTION_KEY` — base64-encoded 32-byte AES-256-GCM key (required); generate with
+  `openssl rand -base64 32`
+- `MULTIPLEXER_SERVICE_KEY` — bearer token for callers (required); generate with
+  `openssl rand -hex 32`
+- `MULTIPLEXER_PORT` — listen port (default `13082`)
+- `MULTIPLEXER_HOST` — listen host (default `0.0.0.0`)
+- `MULTIPLEXER_IDLE_TIMEOUT` — child idle timeout (default `10m`)
+- `MULTIPLEXER_POLL_INTERVAL` — token-refresh poll interval (default `30s`)
+- `MCP_SERVER_BIN` — path to upstream binary (default `/usr/local/bin/mcp-server`)
+
+**Tests:**
+```sh
+# Unit + integration (fake child, all non-DB tests run without Postgres):
+go test ./pkg/multiplexer/... -short -timeout 30s
+
+# Integration tests (DBReader, real DB):
+TEST_DATABASE_URL=postgres://... go test ./pkg/multiplexer/... -timeout 60s
 ```
