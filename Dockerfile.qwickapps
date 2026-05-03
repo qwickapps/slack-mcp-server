@@ -29,6 +29,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/token-bridge ./cmd/token-bridge
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/multiplexer ./cmd/multiplexer
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/setup ./cmd/setup
 
 # qwickapps-base ships node + curl + tailscale + ca-certificates (see qwickapps/node Dockerfile).
 # If a future base rebuild drops these, the build below will fail loudly — that is the desired failure mode.
@@ -46,6 +47,10 @@ COPY --from=builder /out/token-bridge /usr/local/bin/token-bridge
 # QwickApps multiplexer (see cmd/multiplexer). Fronts per-team mcp-server
 # children; selected via CMD override at the CapRover-app level.
 COPY --from=builder /out/multiplexer /usr/local/bin/multiplexer
+
+# QwickApps setup service (see cmd/setup). Tailscale-only install page that
+# templates the userscript; selected via CMD override at the CapRover-app level.
+COPY --from=builder /out/setup /usr/local/bin/setup
 
 # SQL migrations applied by token-bridge on startup.
 COPY --from=builder /src/migrations /app/migrations
@@ -76,6 +81,7 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 #   - upstream mcp-server (SSE, single-tenant): CMD ["/usr/local/bin/mcp-server", "--transport", "sse"]
 #   - token-bridge sidecar:                     CMD ["/usr/local/bin/token-bridge"]
 #   - multiplexer (multi-tenant, P3):           CMD ["/usr/local/bin/multiplexer"]
+#   - setup service (Tailscale-only, P4):       CMD ["/usr/local/bin/setup"]
 CMD ["/usr/local/bin/mcp-server", "--transport", "sse"]
 
 # The SSE endpoint at /sse is the liveness indicator for the MCP server.
