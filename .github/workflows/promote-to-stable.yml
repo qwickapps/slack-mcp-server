@@ -183,16 +183,20 @@ jobs:
           MAX_ATTEMPTS=15
           SLEEP_SEC=20
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            # Use --max-time 2 so curl does not block on long-lived
-            # streams (slack-mcp-server's /sse). Exit 28 (operation
-            # timeout) means curl connected and got 200 OK but kept
-            # the stream open — that is a healthy response. Exit 0
-            # is also healthy.
+            # See promote-to-live.yml for the rationale: exit 28 is
+            # the expected healthy response only for long-poll
+            # endpoints (HEALTH_ACCEPT_TIMEOUT=true). For /health on
+            # the new apps a stalled handler must NOT be reported
+            # as healthy.
             curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1
             rc=$?
             echo "  Attempt ${attempt}/${MAX_ATTEMPTS}: curl exit ${rc}"
-            if [ $rc -eq 0 ] || [ $rc -eq 28 ]; then
-              echo "Stable slot health check passed (exit ${rc})."
+            if [ "$rc" -eq 0 ]; then
+              echo "Stable slot health check passed (exit 0)."
+              exit 0
+            fi
+            if [ "$rc" -eq 28 ] && [ "${HEALTH_ACCEPT_TIMEOUT:-false}" = "true" ]; then
+              echo "Stable slot health check passed (exit 28; long-poll endpoint)."
               exit 0
             fi
             [ "$attempt" -lt "$MAX_ATTEMPTS" ] && sleep "$SLEEP_SEC"

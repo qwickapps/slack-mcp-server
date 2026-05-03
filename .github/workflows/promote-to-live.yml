@@ -162,17 +162,21 @@ jobs:
           MAX_ATTEMPTS=15
           SLEEP_SEC=20
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            # Use --max-time 2 so curl does not block on long-lived
-            # streams (slack-mcp-server's /sse). Exit 28 (operation
-            # timeout) means curl connected and got 200 OK but kept
-            # the stream open — that is a healthy response. Exit 0
-            # is also healthy (the /health endpoints on the new
-            # apps return immediately).
+            # --max-time 2 keeps curl from blocking on long-lived
+            # streams (slack-mcp-server's /sse stays open after 200
+            # OK; for that endpoint exit 28 is the *expected* healthy
+            # response). For /health endpoints on the new apps a 2s+
+            # handler is a stall signal, not health — HEALTH_ACCEPT_TIMEOUT
+            # is "false" there, so only exit 0 counts.
             curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1
             rc=$?
             echo "  Attempt ${attempt}/${MAX_ATTEMPTS}: curl exit ${rc}"
-            if [ $rc -eq 0 ] || [ $rc -eq 28 ]; then
-              echo "Health check passed (exit ${rc})."
+            if [ "$rc" -eq 0 ]; then
+              echo "Health check passed (exit 0)."
+              exit 0
+            fi
+            if [ "$rc" -eq 28 ] && [ "${HEALTH_ACCEPT_TIMEOUT:-false}" = "true" ]; then
+              echo "Health check passed (exit 28; long-poll endpoint)."
               exit 0
             fi
             [ "$attempt" -lt "$MAX_ATTEMPTS" ] && sleep "$SLEEP_SEC"

@@ -70,6 +70,13 @@ esac
 
 APP_NAME=""
 HEALTH_PATH=""
+# Whether `curl --max-time 2` exit 28 (timeout) counts as healthy.
+# True for long-lived stream endpoints (slack-mcp-server's /sse stays
+# open after 200 OK); false for normal /health endpoints where a 2s+
+# handler is itself a symptom of a stalled service. Pass-2 review
+# concern: the universal "exit 0 OR 28" check was too permissive for
+# the new apps' /health endpoints.
+HEALTH_ACCEPT_TIMEOUT=""
 LIVE_APP=""
 STABLE_APP=""
 LIVE_APP_URL=""
@@ -82,8 +89,15 @@ case "$APP" in
   slack-mcp-server)
     # Legacy convention — preserve exactly so the existing operator
     # runbooks keep working. /sse is the MCP SSE endpoint.
+    # TODO(qwickapps/slack-mcp-server#82): once the cutover lands and
+    # the legacy single-binary path is retired, the slack-mcp-server
+    # branch here can be removed and the workflow becomes purely the
+    # new gap-4 convention.
     APP_NAME="slack-mcp-server"
     HEALTH_PATH="/sse"
+    # /sse holds the SSE stream open after 200 OK; curl exit 28
+    # (--max-time 2 reached) is the *expected* healthy response.
+    HEALTH_ACCEPT_TIMEOUT="true"
     IMAGE_REF_VALIDATOR_PREFIX="ghcr.io/qwickapps/img-slack-mcp-server-"
     case "$ENVIRONMENT" in
       prod)
@@ -111,6 +125,9 @@ case "$APP" in
     # name as the production app. Live slot is `<app>-live`.
     APP_NAME="$APP"
     HEALTH_PATH="/health"
+    # /health is a normal request/response endpoint; a 2s+ handler is
+    # a stall signal, NOT a healthy response. Accept exit 0 only.
+    HEALTH_ACCEPT_TIMEOUT="false"
     IMAGE_REF_VALIDATOR_PREFIX="ghcr.io/qwickapps/img-${APP_NAME}-"
     case "$ENVIRONMENT" in
       prod)
@@ -144,6 +161,21 @@ esac
 
 emit() {
   local key="$1" value="$2"
+  # Pass-2 review nit: $GITHUB_ENV uses `KEY=value\n` so any value
+  # containing `=` or a newline would silently corrupt the env file
+  # for downstream steps. Today's values (URLs, slot names, image
+  # prefixes) are safe, but the guard prevents a future maintainer
+  # from quietly breaking everything that reads from GITHUB_ENV.
+  case "$value" in
+    *$'\n'*)
+      echo "::error::resolved value for $key contains a newline; refusing to write to GITHUB_ENV" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$value" == *"="* ]]; then
+    echo "::error::resolved value for $key contains '='; refusing to write to GITHUB_ENV" >&2
+    exit 2
+  fi
   if [ "$PRINT_TO_STDOUT" = "true" ] || [ -z "${GITHUB_ENV:-}" ]; then
     printf '%s=%s\n' "$key" "$value"
   fi
@@ -154,6 +186,7 @@ emit() {
 
 emit APP_NAME                   "$APP_NAME"
 emit HEALTH_PATH                "$HEALTH_PATH"
+emit HEALTH_ACCEPT_TIMEOUT      "$HEALTH_ACCEPT_TIMEOUT"
 emit LIVE_APP                   "$LIVE_APP"
 emit STABLE_APP                 "$STABLE_APP"
 emit LIVE_APP_URL               "$LIVE_APP_URL"

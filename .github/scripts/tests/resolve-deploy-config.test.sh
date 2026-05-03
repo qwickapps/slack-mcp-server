@@ -44,6 +44,9 @@ assert "slack-mcp-server prod STABLE_APP=slack-mcp-server-stable (legacy keeps -
 assert "slack-mcp-server prod HEALTH_PATH=/sse" \
   bash -c "[ \"\$(bash '$RESOLVER' --app slack-mcp-server --environment prod --print 2>/dev/null | awk -F= '\$1==\"HEALTH_PATH\"{print \$2}')\" = '/sse' ]"
 
+assert "slack-mcp-server HEALTH_ACCEPT_TIMEOUT=true (SSE long-poll)" \
+  bash -c "[ \"\$(bash '$RESOLVER' --app slack-mcp-server --environment prod --print 2>/dev/null | awk -F= '\$1==\"HEALTH_ACCEPT_TIMEOUT\"{print \$2}')\" = 'true' ]"
+
 assert "slack-mcp-server uat LIVE_APP=slack-mcp-server-uat (legacy: no -live suffix in uat)" \
   bash -c "[ \"\$(bash '$RESOLVER' --app slack-mcp-server --environment uat --print 2>/dev/null | awk -F= '\$1==\"LIVE_APP\"{print \$2}')\" = 'slack-mcp-server-uat' ]"
 
@@ -62,6 +65,9 @@ for app in slack-bridge slack-multiplexer slack-setup; do
 
   assert "$app prod HEALTH_PATH=/health" \
     bash -c "[ \"\$(bash '$RESOLVER' --app $app --environment prod --print 2>/dev/null | awk -F= '\$1==\"HEALTH_PATH\"{print \$2}')\" = '/health' ]"
+
+  assert "$app HEALTH_ACCEPT_TIMEOUT=false (stalled handler != healthy)" \
+    bash -c "[ \"\$(bash '$RESOLVER' --app $app --environment prod --print 2>/dev/null | awk -F= '\$1==\"HEALTH_ACCEPT_TIMEOUT\"{print \$2}')\" = 'false' ]"
 
   assert "$app prod IMAGE_REF_VALIDATOR_PREFIX includes app name" \
     bash -c "bash '$RESOLVER' --app $app --environment prod --print 2>/dev/null | awk -F= '\$1==\"IMAGE_REF_VALIDATOR_PREFIX\"{print \$2}' | grep -q 'img-${app}-'"
@@ -103,10 +109,10 @@ assert "unknown flag rejects (rc=2)" \
 # ── Output discipline ───────────────────────────────────────────────────
 echo "== output discipline =="
 
-assert "all 9 expected keys present in --print output" \
+assert "all 10 expected keys present in --print output" \
   bash -c "
     out=\$(bash '$RESOLVER' --app slack-bridge --environment prod --print 2>/dev/null)
-    for k in APP_NAME HEALTH_PATH LIVE_APP STABLE_APP LIVE_APP_URL STABLE_APP_URL BASE_IMAGE_NAME IMAGE_REF_VALIDATOR_PREFIX GATEWAY_APP_NAME; do
+    for k in APP_NAME HEALTH_PATH HEALTH_ACCEPT_TIMEOUT LIVE_APP STABLE_APP LIVE_APP_URL STABLE_APP_URL BASE_IMAGE_NAME IMAGE_REF_VALIDATOR_PREFIX GATEWAY_APP_NAME; do
       echo \"\$out\" | grep -q \"^\${k}=\" || { echo \"missing key: \$k\"; exit 1; }
     done
   "
