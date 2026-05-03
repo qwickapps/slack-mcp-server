@@ -18,8 +18,14 @@
 // @grant        GM_getValue
 // @grant        unsafeWindow
 // @connect      __BRIDGE_HOST__
+// @downloadURL  __DOWNLOAD_URL__
 // @run-at       document-idle
 // ==/UserScript==
+// NOTE: @updateURL is intentionally omitted. The setup service requires a
+// SETUP_SERVICE_KEY bearer header that Tampermonkey cannot send during
+// auto-update checks — pointing @updateURL at it would only produce 401
+// noise. Updates are manual: re-run the install curl to fetch a fresh
+// copy and drag it into Tampermonkey.
 
 (function () {
   'use strict';

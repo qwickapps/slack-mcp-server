@@ -70,6 +70,14 @@ const pastSkew = 5 * time.Minute
 //
 // hmacKey authenticates the userscript; cipher encrypts the xoxc/xoxd
 // pair at rest. Both must be non-zero.
+//
+// IMPORTANT: error responses must stay generic — never echo back any
+// portion of the request body or its decoded fields. The userscript
+// logs up to 200 chars of failed-response body to the browser console
+// (qwickapps-slack-bridge.user.js handles the !=200 branch by writing
+// a snippet of resp.responseText), so leaking xoxc/xoxd values, tokens,
+// or HMAC fragments here would surface them in the user's devtools.
+// Use fixed strings ("invalid signature", "malformed body", etc.).
 func RefreshHandler(store WorkspaceStore, hmacKey []byte, cipher *Cipher) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
