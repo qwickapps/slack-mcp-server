@@ -1,16 +1,34 @@
-# qwickapps/slack-mcp-server — manual promote-to-stable for the blue-green pipeline.
-# Re-tags an image as stable-<version>-<sha> in GHCR and deploys to the stable slot.
+# qwickapps/slack-mcp-server — manual promote-to-stable for the
+# blue-green pipeline. Re-tags an image as stable-<version>-<sha> in
+# GHCR and deploys to the stable slot.
+#
+# qwickapps/mcp#84 Gap-4 generalisation: this workflow now accepts an
+# `app_name` input (default: slack-mcp-server) so the same workflow
+# promotes any of the four apps in the slack ecosystem:
+#   slack-mcp-server | slack-bridge | slack-multiplexer | slack-setup
+# Per-app slot names, health paths, and image refs are resolved at
+# the head of the run via .github/scripts/resolve-deploy-config.sh.
 
-name: Promote slack-mcp-server to Stable
+name: Promote to Stable
 
 on:
   workflow_dispatch:
     inputs:
+      app_name:
+        description: 'Which app to promote'
+        required: true
+        type: choice
+        options:
+          - slack-mcp-server
+          - slack-bridge
+          - slack-multiplexer
+          - slack-setup
+        default: slack-mcp-server
       image_ref:
         description: |
           Full GHCR image reference to tag as stable and deploy.
           Use the SAME image_ref that was promoted to live.
-          Example: ghcr.io/qwickapps/img-slack-mcp-server-prod:1.0.0.42
+          Example: ghcr.io/qwickapps/img-<app>-prod:1.0.0.42
         required: true
         type: string
       environment:
@@ -21,18 +39,25 @@ on:
         default: prod
 
 concurrency:
-  group: slack-mcp-server-promote-stable-${{ inputs.environment }}
+  group: promote-stable-${{ inputs.app_name }}-${{ inputs.environment }}
   cancel-in-progress: false
 
 env:
-  APP_NAME: slack-mcp-server
   OWNER: qwickapps
-  HEALTH_PATH: /sse
 
 jobs:
   promote-to-stable:
     runs-on: [self-hosted, macmini]
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve app config
+        run: |
+          chmod +x .github/scripts/resolve-deploy-config.sh
+          .github/scripts/resolve-deploy-config.sh \
+            --app "${{ inputs.app_name }}" \
+            --environment "${{ inputs.environment }}"
+
       - name: Validate image_ref input
         run: |
           IMAGE_REF="${{ inputs.image_ref }}"
@@ -40,10 +65,10 @@ jobs:
             echo "ERROR: image_ref input is required."
             exit 1
           fi
-          if ! echo "$IMAGE_REF" | grep -q 'ghcr.io/qwickapps/img-slack-mcp-server-'; then
-            echo "ERROR: image_ref does not look like a slack-mcp-server GHCR image."
-            echo "  Got: $IMAGE_REF"
-            echo "  Expected format: ghcr.io/qwickapps/img-slack-mcp-server-{prod|uat}:<tag>"
+          if ! echo "$IMAGE_REF" | grep -q "$IMAGE_REF_VALIDATOR_PREFIX"; then
+            echo "ERROR: image_ref does not look like a $APP_NAME GHCR image."
+            echo "  Got:      $IMAGE_REF"
+            echo "  Expected: ${IMAGE_REF_VALIDATOR_PREFIX}{prod|uat}:<tag>"
             exit 1
           fi
           # Extract version tag (e.g. "1.0.0.42") from image_ref
@@ -56,37 +81,17 @@ jobs:
           echo "STABLE_TAG=${STABLE_TAG}"   >> "$GITHUB_ENV"
           echo "Stable tag will be: ${STABLE_TAG}"
 
-      - name: Resolve CapRover credentials and slot names
+      - name: Resolve CapRover credentials
         run: |
-          ENV="${{ inputs.environment }}"
-
-          case "$ENV" in
-            prod)
-              STABLE_APP="${{ env.APP_NAME }}-stable"
-              CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
-              CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
-              STABLE_APP_URL="https://${{ env.APP_NAME }}-stable.app.qwickforge.com"
-              # Derive the base image name from prod image_ref for re-tagging
-              BASE_IMAGE_NAME="ghcr.io/${{ env.OWNER }}/img-${{ env.APP_NAME }}-prod"
-              ;;
-            uat)
-              STABLE_APP="${{ env.APP_NAME }}-uat-stable"
-              CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
-              CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
-              STABLE_APP_URL="https://${{ env.APP_NAME }}-uat-stable.app.qwickforge.com"
-              BASE_IMAGE_NAME="ghcr.io/${{ env.OWNER }}/img-${{ env.APP_NAME }}-uat"
-              ;;
-          esac
+          CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
+          CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
 
           echo "::add-mask::$CAPROVER_PASSWORD"
           echo "::add-mask::${{ secrets.GHCR_PUSH_TOKEN }}"
           echo "::add-mask::${{ secrets.GHCR_PULL_TOKEN }}"
 
-          echo "STABLE_APP=${STABLE_APP}"               >> "$GITHUB_ENV"
-          echo "CAPROVER_URL=${CAPROVER_URL}"           >> "$GITHUB_ENV"
-          echo "CAPROVER_PASSWORD=${CAPROVER_PASSWORD}" >> "$GITHUB_ENV"
-          echo "STABLE_APP_URL=${STABLE_APP_URL}"       >> "$GITHUB_ENV"
-          echo "BASE_IMAGE_NAME=${BASE_IMAGE_NAME}"     >> "$GITHUB_ENV"
+          echo "CAPROVER_URL=${CAPROVER_URL}"             >> "$GITHUB_ENV"
+          echo "CAPROVER_PASSWORD=${CAPROVER_PASSWORD}"   >> "$GITHUB_ENV"
           echo "GHCR_PUSH_TOKEN=${{ secrets.GHCR_PUSH_TOKEN }}" >> "$GITHUB_ENV"
           echo "GHCR_PULL_TOKEN=${{ secrets.GHCR_PULL_TOKEN }}" >> "$GITHUB_ENV"
 
@@ -173,14 +178,16 @@ jobs:
 
       - name: Validate stable slot health
         run: |
-          HEALTH_URL="${STABLE_APP_URL}${{ env.HEALTH_PATH }}"
+          HEALTH_URL="${STABLE_APP_URL}${HEALTH_PATH}"
           echo "Waiting for ${HEALTH_URL} to become healthy..."
           MAX_ATTEMPTS=15
           SLEEP_SEC=20
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            # Use --max-time 2 so curl does not block on the SSE stream forever.
-            # Exit 28 (operation timeout) means curl connected and got 200 OK but kept the
-            # SSE stream open — that is a healthy response. Exit 0 is also healthy.
+            # Use --max-time 2 so curl does not block on long-lived
+            # streams (slack-mcp-server's /sse). Exit 28 (operation
+            # timeout) means curl connected and got 200 OK but kept
+            # the stream open — that is a healthy response. Exit 0
+            # is also healthy.
             curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1
             rc=$?
             echo "  Attempt ${attempt}/${MAX_ATTEMPTS}: curl exit ${rc}"
@@ -207,18 +214,21 @@ jobs:
 
           if [ "$STATUS" = "success" ]; then
             EMOJI="[OK]"
-            printf -v MSG '%s\n\n%s\n%s\n%s\n%s\n\n%s' \
-              "${EMOJI} slack-mcp-server promoted to STABLE (${ENV})" \
-              "Source image: ${image_ref}" \
-              "Stable image: ${STABLE_IMAGE_VERSIONED}" \
-              "Stable URL:   ${STABLE_APP_URL}" \
+            printf -v MSG '%s\n\n%s\n%s\n%s\n%s\n%s\n\n%s' \
+              "${EMOJI} ${APP_NAME} promoted to STABLE (${ENV})" \
+              "App:           ${APP_NAME}" \
+              "Source image:  ${image_ref}" \
+              "Stable image:  ${STABLE_IMAGE_VERSIONED}" \
+              "Stable slot:   ${STABLE_APP}" \
+              "Stable URL:    ${STABLE_APP_URL}" \
               "Run: ${RUN_URL}" \
               "This image is now the rollback target for ${ENV}."
           else
             EMOJI="[FAIL]"
-            printf -v MSG '%s\n\n%s\n%s\n%s\n\n%s' \
-              "${EMOJI} slack-mcp-server promote-to-stable FAILED (${ENV})" \
-              "Source image: ${image_ref}" \
+            printf -v MSG '%s\n\n%s\n%s\n%s\n%s\n\n%s' \
+              "${EMOJI} ${APP_NAME} promote-to-stable FAILED (${ENV})" \
+              "App:                  ${APP_NAME}" \
+              "Source image:         ${image_ref}" \
               "Stable tag attempted: ${STABLE_TAG}" \
               "Run: ${RUN_URL}" \
               "The live slot remains the last known-good. Check logs."

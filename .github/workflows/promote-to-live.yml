@@ -1,19 +1,38 @@
 # qwickapps/slack-mcp-server — manual promote-to-live for the blue-green pipeline.
-# Health validation is implemented as an inline curl loop so this workflow
-# is self-contained.
 #
-# Health path: /sse (the MCP SSE endpoint; upstream has no dedicated /_health).
-# Port: 13080 (controlled via SLACK_MCP_PORT env var — no --port CLI flag).
+# qwickapps/mcp#84 Gap-4 generalisation: this workflow now accepts an
+# `app_name` input (default: slack-mcp-server) so the same workflow
+# promotes any of the four apps in the slack ecosystem:
+#   slack-mcp-server | slack-bridge | slack-multiplexer | slack-setup
+# Per-app slot names, health paths, and image refs are resolved at
+# the head of the run via .github/scripts/resolve-deploy-config.sh.
+#
+# Health endpoints differ per app:
+#   slack-mcp-server  -> /sse  (SSE stream — curl --max-time 2;
+#                               exit 0 OR 28 means healthy)
+#   slack-bridge      -> /health
+#   slack-multiplexer -> /health
+#   slack-setup       -> /health
 
-name: Promote slack-mcp-server to Live
+name: Promote to Live
 
 on:
   workflow_dispatch:
     inputs:
+      app_name:
+        description: 'Which app to promote'
+        required: true
+        type: choice
+        options:
+          - slack-mcp-server
+          - slack-bridge
+          - slack-multiplexer
+          - slack-setup
+        default: slack-mcp-server
       image_ref:
         description: |
           Full GHCR image reference to deploy as live.
-          Example: ghcr.io/qwickapps/img-slack-mcp-server-prod:1.0.0.42
+          Example: ghcr.io/qwickapps/img-<app>-prod:1.0.0.42
         required: true
         type: string
       environment:
@@ -24,18 +43,27 @@ on:
         default: prod
 
 concurrency:
-  group: slack-mcp-server-promote-live-${{ inputs.environment }}
+  # Group by app + environment so two promotions of the same app can't
+  # race, but different apps can promote in parallel.
+  group: promote-live-${{ inputs.app_name }}-${{ inputs.environment }}
   cancel-in-progress: false
 
 env:
-  APP_NAME: slack-mcp-server
   OWNER: qwickapps
-  HEALTH_PATH: /sse
 
 jobs:
   promote-to-live:
     runs-on: [self-hosted, macmini]
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve app config
+        run: |
+          chmod +x .github/scripts/resolve-deploy-config.sh
+          .github/scripts/resolve-deploy-config.sh \
+            --app "${{ inputs.app_name }}" \
+            --environment "${{ inputs.environment }}"
+
       - name: Validate image_ref input
         run: |
           IMAGE_REF="${{ inputs.image_ref }}"
@@ -43,43 +71,24 @@ jobs:
             echo "ERROR: image_ref input is required."
             exit 1
           fi
-          if ! echo "$IMAGE_REF" | grep -q 'ghcr.io/qwickapps/img-slack-mcp-server-'; then
-            echo "ERROR: image_ref does not look like a slack-mcp-server GHCR image."
-            echo "  Got: $IMAGE_REF"
-            echo "  Expected format: ghcr.io/qwickapps/img-slack-mcp-server-{prod|uat}:<tag>"
+          if ! echo "$IMAGE_REF" | grep -q "$IMAGE_REF_VALIDATOR_PREFIX"; then
+            echo "ERROR: image_ref does not look like a $APP_NAME GHCR image."
+            echo "  Got:      $IMAGE_REF"
+            echo "  Expected: ${IMAGE_REF_VALIDATOR_PREFIX}{prod|uat}:<tag>"
             exit 1
           fi
           echo "image_ref=${IMAGE_REF}" >> "$GITHUB_ENV"
 
-      - name: Resolve CapRover credentials and slot names
+      - name: Resolve CapRover credentials
         run: |
-          ENV="${{ inputs.environment }}"
-
-          case "$ENV" in
-            prod)
-              LIVE_APP="${{ env.APP_NAME }}-live"
-              CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
-              CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
-              LIVE_APP_URL="https://${{ env.APP_NAME }}-live.app.qwickforge.com"
-              GATEWAY_APP_NAME="${{ env.APP_NAME }}"
-              ;;
-            uat)
-              LIVE_APP="${{ env.APP_NAME }}-uat"
-              CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
-              CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
-              LIVE_APP_URL="https://${{ env.APP_NAME }}-uat.app.qwickforge.com"
-              GATEWAY_APP_NAME="${{ env.APP_NAME }}-uat"
-              ;;
-          esac
+          CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
+          CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
 
           echo "::add-mask::$CAPROVER_PASSWORD"
           echo "::add-mask::${{ secrets.GHCR_PULL_TOKEN }}"
 
-          echo "LIVE_APP=${LIVE_APP}"                 >> "$GITHUB_ENV"
-          echo "CAPROVER_URL=${CAPROVER_URL}"         >> "$GITHUB_ENV"
-          echo "CAPROVER_PASSWORD=${CAPROVER_PASSWORD}" >> "$GITHUB_ENV"
-          echo "LIVE_APP_URL=${LIVE_APP_URL}"         >> "$GITHUB_ENV"
-          echo "GATEWAY_APP_NAME=${GATEWAY_APP_NAME}" >> "$GITHUB_ENV"
+          echo "CAPROVER_URL=${CAPROVER_URL}"             >> "$GITHUB_ENV"
+          echo "CAPROVER_PASSWORD=${CAPROVER_PASSWORD}"   >> "$GITHUB_ENV"
           echo "GHCR_PULL_TOKEN=${{ secrets.GHCR_PULL_TOKEN }}" >> "$GITHUB_ENV"
 
       - name: Obtain CapRover auth token
@@ -148,14 +157,17 @@ jobs:
 
       - name: Validate live slot health
         run: |
-          HEALTH_URL="${LIVE_APP_URL}${{ env.HEALTH_PATH }}"
+          HEALTH_URL="${LIVE_APP_URL}${HEALTH_PATH}"
           echo "Waiting for ${HEALTH_URL} to become healthy..."
           MAX_ATTEMPTS=15
           SLEEP_SEC=20
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            # Use --max-time 2 so curl does not block on the SSE stream forever.
-            # Exit 28 (operation timeout) means curl connected and got 200 OK but kept the
-            # SSE stream open — that is a healthy response. Exit 0 is also healthy.
+            # Use --max-time 2 so curl does not block on long-lived
+            # streams (slack-mcp-server's /sse). Exit 28 (operation
+            # timeout) means curl connected and got 200 OK but kept
+            # the stream open — that is a healthy response. Exit 0
+            # is also healthy (the /health endpoints on the new
+            # apps return immediately).
             curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1
             rc=$?
             echo "  Attempt ${attempt}/${MAX_ATTEMPTS}: curl exit ${rc}"
@@ -181,18 +193,20 @@ jobs:
 
           if [ "$STATUS" = "success" ]; then
             EMOJI="[OK]"
-            printf -v MSG '%s\n\n%s\n%s\n%s\n\n%s\n  image_ref: %s' \
-              "${EMOJI} slack-mcp-server promoted to LIVE (${ENV})" \
+            printf -v MSG '%s\n\n%s\n%s\n%s\n\n%s\n  app_name:  %s\n  image_ref: %s' \
+              "${EMOJI} ${APP_NAME} promoted to LIVE (${ENV})" \
               "Image: ${IMAGE_REF}" \
               "Live URL: ${LIVE_APP_URL}" \
               "Run: ${RUN_URL}" \
               "Next step — to promote to stable, run promote-to-stable.yml with:" \
+              "${APP_NAME}" \
               "${IMAGE_REF}"
           else
             EMOJI="[FAIL]"
-            printf -v MSG '%s\n\n%s\n%s\n\n%s' \
-              "${EMOJI} slack-mcp-server promote-to-live FAILED (${ENV})" \
+            printf -v MSG '%s\n\n%s\n%s\n%s\n\n%s' \
+              "${EMOJI} ${APP_NAME} promote-to-live FAILED (${ENV})" \
               "Image: ${IMAGE_REF}" \
+              "App:   ${APP_NAME}" \
               "Run: ${RUN_URL}" \
               "Check logs before re-attempting."
           fi
