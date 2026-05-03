@@ -209,8 +209,10 @@ func (h *Handler) handleHealth() http.Handler {
 // means the comparison time leaks the *length* of the supplied
 // token. That's safe here because key is SETUP_SERVICE_KEY — a
 // fixed deployment value — so an attacker who knows we're running
-// this binary already knows the expected length (32 bytes from
-// `openssl rand -hex 32` per README). No new information is leaked.
+// this binary already knows the expected length (the README's
+// `openssl rand -hex 32` produces a 64-character hex string from
+// 32 bytes of entropy; what gets length-compared is that 64-char
+// value). No new information is leaked.
 func bearerValid(r *http.Request, key string) bool {
 	auth := r.Header.Get("Authorization")
 	const prefix = "Bearer "

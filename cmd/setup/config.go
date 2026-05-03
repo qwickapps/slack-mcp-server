@@ -74,6 +74,13 @@ func getenvDefault(k, def string) string {
 // a misconfigured BRIDGE_URL — better a fast-fail at boot than a userscript
 // that silently can't reach the bridge (the @connect directive only
 // allow-lists a parseable host).
+//
+// BRIDGE_URL is expected to be a host-only or host+path URL — no query
+// string, no fragment. The TrimRight here strips trailing slashes from
+// the whole string, which is correct for that shape. A pathological
+// input like "https://host?foo=bar/" would have its trailing slash
+// stripped from the query string, which is harmless given the
+// no-query-string contract but worth flagging here.
 func validateBridgeURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
