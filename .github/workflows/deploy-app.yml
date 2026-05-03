@@ -46,6 +46,11 @@ on:
         type: string
         default: 'schema,logging,auth,react-framework,auth-client,cms,server'
 
+      image_ref:
+        description: 'Optional prebuilt image ref to deploy. When set, this workflow skips its build job and deploys the provided image. Used by the three-app caller to share one Docker build across multiple CapRover apps.'
+        type: string
+        default: ''
+
       container_port:
         description: 'Container port the app listens on. REQUIRED — pass explicitly from caller.'
         type: string
@@ -141,7 +146,11 @@ jobs:
           TAG="${VERSION}.${{ github.run_number }}"
           ENV="${{ inputs.environment }}"
           APP="${{ inputs.app_name }}"
-          IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/img-${APP}-${ENV}:${TAG}"
+          if [ -n "${{ inputs.image_ref }}" ]; then
+            IMAGE="${{ inputs.image_ref }}"
+          else
+            IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/img-${APP}-${ENV}:${TAG}"
+          fi
 
           case "$ENV" in
             prod)
@@ -207,6 +216,7 @@ jobs:
   # ── Phase 1: Build & push Docker image ───────────────────────────────────────
   build:
     needs: prepare
+    if: inputs.image_ref == ''
     runs-on: [self-hosted, macmini]
     # GHCR push uses GHCR_PUSH_TOKEN PAT (see "Login to GHCR" step) — we don't
     # need elevated GITHUB_TOKEN packages:write, which the qwickapps org policy
@@ -292,6 +302,10 @@ jobs:
   # skips env update and just ensures the app exists.
   provision-app:
     needs: [prepare, build]
+    if: |
+      always() &&
+      needs.prepare.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: [self-hosted, macmini]
     concurrency:
       group: caprover-provision-${{ inputs.app_name }}-${{ inputs.environment }}
@@ -379,6 +393,10 @@ jobs:
   # ── Phase 1.5 (parallel with build): Provision gateway route ─────────────────
   provision-gateway:
     needs: [prepare, build]
+    if: |
+      always() &&
+      needs.prepare.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: [self-hosted, macmini]
     continue-on-error: true
     concurrency:
@@ -419,8 +437,9 @@ jobs:
   deploy-and-verify:
     needs: [prepare, build, provision-app, provision-gateway]
     if: |
+      always() &&
       needs.prepare.result == 'success' &&
-      needs.build.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
       needs.provision-app.result == 'success' &&
       (needs.provision-gateway.result == 'success' || needs.provision-gateway.result == 'skipped')
     runs-on: [self-hosted, macmini]
@@ -598,8 +617,9 @@ jobs:
   traffic-light-deploy:
     needs: [prepare, build, provision-app, provision-gateway, deploy-and-verify]
     if: |
+      always() &&
       needs.prepare.result == 'success' &&
-      needs.build.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
       needs.provision-app.result == 'success' &&
       needs.deploy-and-verify.result == 'success'
     runs-on: [self-hosted, macmini]

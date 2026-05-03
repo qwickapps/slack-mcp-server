@@ -22,11 +22,10 @@
 # qwickapps/slack-mcp-server`s legacy single-binary caller (deploy.yml)
 # remains for the upstream `slack-mcp-server` app and is unaffected.
 #
-# Note on duplicate builds: each matrix variant rebuilds the same
-# Dockerfile.qwickapps and pushes a per-app image tag (img-slack-bridge-dev,
-# img-slack-multiplexer-dev, img-slack-setup-dev). A single shared build
-# job would save runner time but is out of scope for this PR (#84
-# observation note); the fan-out shape is what unblocks #81.
+# The image is built once by this caller and passed by digest to all three
+# deploy-app.yml matrix branches. deploy-app.yml skips its own build job when
+# image_ref is supplied, so the three CapRover apps consume the exact same
+# immutable image.
 
 name: Deploy slack-mcp-server (3 apps)
 
@@ -91,8 +90,8 @@ jobs:
 
   # ── Write per-app env files ────────────────────────────────────────────────
   # One env file per app, written to /tmp on the runner. deploy-app.yml's
-  # provision-app step reads /tmp/app-env-${app_name}.env, so the file name
-  # must match the app_name passed in the matrix.
+  # provision-app step reads /tmp/app-env-${ENV}-${app_name}.env, so the
+  # environment and app name must match the matrix deploy inputs.
   #
   # Secret distribution per qwickapps/mcp#81:
   #   - BRIDGE_HMAC_KEY        → slack-bridge + slack-setup (must match)
@@ -234,15 +233,98 @@ jobs:
             echo "Wrote /tmp/app-env-${ENV}-${f}.env ($(wc -l < "/tmp/app-env-${ENV}-${f}.env") lines)"
           done
 
+  # ── Build shared image once ────────────────────────────────────────────────
+  build:
+    needs: resolve-env
+    runs-on: [self-hosted, macmini]
+    outputs:
+      image_ref: ${{ steps.digest.outputs.image_ref }}
+      tag:       ${{ steps.meta.outputs.tag }}
+    env:
+      REGISTRY: ghcr.io
+      OWNER: qwickapps
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate shared image metadata
+        id: meta
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="${VERSION}.${{ github.run_number }}"
+          ENV="${{ needs.resolve-env.outputs.environment }}"
+          IMAGE_NAME="${{ env.REGISTRY }}/${{ env.OWNER }}/img-slack-mcp-server-${ENV}"
+
+          echo "tag=${TAG}"               >> "$GITHUB_OUTPUT"
+          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure Docker endpoint
+        run: |
+          chmod +x .github/scripts/resolve-docker-endpoint.sh
+          .github/scripts/resolve-docker-endpoint.sh
+
+      - name: Login to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          TMPDIR_DOCKER="$(mktemp -d)"
+          AUTH_B64=$(printf '%s:%s' "${{ github.actor }}" "$GHCR_TOKEN" | base64 | tr -d '\n')
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$AUTH_B64" > "$TMPDIR_DOCKER/config.json"
+          export DOCKER_CONFIG="$TMPDIR_DOCKER"
+          echo "DOCKER_CONFIG=$TMPDIR_DOCKER" >> "$GITHUB_ENV"
+          echo "GHCR credentials written to $TMPDIR_DOCKER/config.json (no docker login, no keychain)"
+
+      - name: Clean up stale buildx builders
+        run: |
+          docker ps -a --filter name=buildx_buildkit_ --format '{{.Names}}' | xargs -r docker rm -f 2>/dev/null || true
+          docker buildx rm --all-inactive --force 2>/dev/null || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Build and push shared image
+        id: docker-build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.qwickapps
+          push: true
+          platforms: linux/arm64
+          tags: |
+            ${{ steps.meta.outputs.image_name }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image_name }}:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Publish digest image ref
+        id: digest
+        run: |
+          DIGEST="${{ steps.docker-build.outputs.digest }}"
+          if [ -z "$DIGEST" ]; then
+            echo "ERROR: docker/build-push-action did not return a digest."
+            exit 1
+          fi
+          IMAGE_REF="${{ steps.meta.outputs.image_name }}@${DIGEST}"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Shared image: ${IMAGE_REF}"
+
+      - name: Rotate build cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
   # ── Deploy each app via deploy-app.yml ─────────────────────────────────────
   # Matrix-on-uses fans out three independent calls. Each one runs the full
-  # blue-green pipeline (build → provision → deploy → health-check → swap).
+  # blue-green pipeline (provision → deploy → health-check → swap) using the
+  # shared image digest built above.
   # Per-app inputs:
   #   container_port — must match the binary's listening port
   #   public_url     — what the gateway / external caller hits
   #   cmd            — absolute binary path inside Dockerfile.qwickapps
   deploy:
-    needs: [resolve-env, write-env-files]
+    needs: [resolve-env, write-env-files, build]
     strategy:
       fail-fast: false
       matrix:
@@ -274,6 +356,7 @@ jobs:
       dockerfile_path:    Dockerfile.qwickapps
       package_json_path:  package.json
       workspace_packages: ''
+      image_ref:          ${{ needs.build.outputs.image_ref }}
       container_port:     ${{ matrix.container_port }}
       health_path:        ${{ matrix.health_path }}
       caprover_host:      ${{ needs.resolve-env.outputs.caprover_host }}

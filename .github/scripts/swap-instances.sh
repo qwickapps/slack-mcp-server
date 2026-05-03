@@ -182,6 +182,39 @@ get_app_definition() {
     | jq --arg name "$app_name" '.data.appDefinitions[] | select(.appName == $name)'
 }
 
+ensure_app_exists() {
+  local app_name="$1"
+
+  if [ -z "$app_name" ]; then
+    return 0
+  fi
+
+  local existing
+  existing=$(get_app_definition "$app_name")
+  if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+    echo "  App exists: $app_name"
+    return 0
+  fi
+
+  echo "  Creating app slot: $app_name"
+  local response
+  response=$(caprover_api_call "Create app slot $app_name" \
+    curl -s -k -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/register" \
+    -H "Content-Type: application/json" \
+    -H "x-captain-auth: $TOKEN" \
+    -d "$(jq -n --arg app "$app_name" '{appName: $app, hasPersistentData: false}')")
+
+  local status desc
+  status=$(echo "$response" | jq -r '.status')
+  desc=$(echo "$response" | jq -r '.description // ""')
+  if [ "$status" = "100" ] || [ "$status" = "1901" ] || echo "$desc" | grep -qi "already"; then
+    echo "  App slot ready: $app_name"
+  else
+    echo "  Error: failed to create app slot $app_name: $desc (status: $status)"
+    exit 1
+  fi
+}
+
 # Issue #13: copy envVars from $1 (source app) into $2 (target app) via the
 # appDefinitions/update endpoint. Read-then-write: target's other fields are
 # preserved. No-op (with warning) when source has zero env vars and no CMD
@@ -369,11 +402,13 @@ if [ "$DIRECTION" = "promote" ]; then
 
   echo ""
   echo "Step 2a: Copy env vars from $APP_BUILD to $APP_LIVE (issue #13)..."
+  ensure_app_exists "$APP_LIVE"
   copy_env_vars "$APP_BUILD" "$APP_LIVE"
 
   if [ -n "$APP_STABLE" ]; then
     echo ""
     echo "Step 2b: Copy env vars from $APP_BUILD to $APP_STABLE (issue #13)..."
+    ensure_app_exists "$APP_STABLE"
     copy_env_vars "$APP_BUILD" "$APP_STABLE"
   fi
 

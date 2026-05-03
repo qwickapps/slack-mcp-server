@@ -244,9 +244,19 @@ SSL_LINENUM=$(grep -n 'appDefinitions/enablebasedomainssl' "$CALL_LOG" \
   | head -n 1 | cut -d: -f1 || true)
 
 if [ -n "$ENV_LINENUM" ] && [ -n "$SSL_LINENUM" ]; then
-  assert "env copy occurs before SSL enable" \
+assert "env copy occurs before SSL enable" \
     test "$ENV_LINENUM" -lt "$SSL_LINENUM"
 fi
+
+# qwickapps/mcp#84 follow-up: first deploy of a new app family may not have
+# a stable slot yet. swap-instances.sh should create it before attempting to
+# copy env/CMD metadata so the copy can succeed once CapRover returns the new
+# app in appDefinitions.
+STABLE_REGISTER_LINE=$(grep 'appDefinitions/register' "$CALL_LOG" \
+  | grep 'slack-mcp-server-stable' \
+  | head -n 1 || true)
+assert "missing stable slot is registered before metadata copy" \
+  test -n "$STABLE_REGISTER_LINE"
 
 # --- Issue #18 BLOCKING: SSL enable failure must NOT trigger forceSsl ---
 #
