@@ -137,7 +137,7 @@
         }
       },
       onerror: function (resp) {
-        console.error('qwickapps-slack-bridge: request error team=' + teamID);
+        console.error('qwickapps-slack-bridge: request error team=' + teamID + ' error=' + (resp && resp.error) + ' status=' + (resp && resp.statusText));
       },
     });
   }
