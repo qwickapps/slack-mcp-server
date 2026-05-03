@@ -150,6 +150,11 @@ jobs:
           echo "::add-mask::$TS_AUTHKEY"
           echo "::add-mask::$TS_API_KEY"
 
+          # Per slack-mcp-server#11 reviewer pass-2: env file path now
+          # includes the environment prefix so a uat run cannot clobber
+          # a dev file (or vice versa) on the shared self-hosted runner.
+          # deploy-app.yml's consumer reads /tmp/app-env-${ENV}-${APP}.env
+          # with a one-cycle fallback to the legacy unprefixed path.
           printf '%s\n' \
             "SLACK_MCP_XOXP_TOKEN=${XOXP_TOKEN}" \
             "SLACK_MCP_XOXC_TOKEN=${XOXC_TOKEN}" \
@@ -162,9 +167,9 @@ jobs:
             "TS_HOSTNAME=slack-mcp-server-${ENV}" \
             "TS_TAGS=tag:container" \
             "TS_API_KEY=${TS_API_KEY}" \
-            > /tmp/app-env-slack-mcp-server.env
+            > "/tmp/app-env-${ENV}-slack-mcp-server.env"
 
-          echo "Wrote /tmp/app-env-slack-mcp-server.env ($(wc -l < /tmp/app-env-slack-mcp-server.env) lines)"
+          echo "Wrote /tmp/app-env-${ENV}-slack-mcp-server.env ($(wc -l < "/tmp/app-env-${ENV}-slack-mcp-server.env") lines)"
 
   # ── DB wipe (dev only) ──────────────────────────────────────────────────────
   # P1/P2: no database. Retained for P3 (token-bridge will need one).
@@ -256,3 +261,24 @@ jobs:
       critical_subsystems: ""
       warning_subsystems:  ""
       prod_critical_subsystems: ""
+
+  # ── Wipe per-app env file from the runner /tmp ──────────────────────────────
+  # Per slack-mcp-server#11 reviewer pass-2: plaintext secrets on /tmp would
+  # otherwise persist until reboot and be readable by anything else running
+  # on the runner. Always runs (success, failure, or matrix abort).
+  cleanup-env-file:
+    needs: [resolve-env, deploy]
+    if: always()
+    runs-on: [self-hosted, macmini]
+    steps:
+      - name: Remove env file
+        env:
+          ENV: ${{ needs.resolve-env.outputs.environment }}
+        run: |
+          f="/tmp/app-env-${ENV}-slack-mcp-server.env"
+          if [ -f "$f" ]; then
+            rm -f "$f"
+            echo "Removed $f"
+          else
+            echo "Already gone: $f"
+          fi

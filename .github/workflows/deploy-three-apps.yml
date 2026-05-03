@@ -8,10 +8,15 @@
 # configure-caprover-app.sh's --cmd flag (writes serviceUpdateOverride).
 #
 # Per qwickapps/mcp#84:
-#   - 3 env files written to /tmp/app-env-{slack-bridge,slack-multiplexer,slack-setup}.env
+#   - 3 env files written to
+#     /tmp/app-env-${ENV}-{slack-bridge,slack-multiplexer,slack-setup}.env
 #     ahead of the matrix fan-out, so each provision-app step picks up
 #     the correct subset (BRIDGE_HMAC_KEY shared by bridge+setup;
-#     TOKEN_ENCRYPTION_KEY shared by bridge+multiplexer; etc.)
+#     TOKEN_ENCRYPTION_KEY shared by bridge+multiplexer; etc.). The
+#     ${ENV} prefix scopes the file per environment so a uat run
+#     launched while dev is in flight on the shared self-hosted
+#     macmini cannot clobber the dev secrets (per slack-mcp-server#11
+#     reviewer pass-2 real concern 1).
 #   - matrix-on-uses runs the three deploy-app.yml calls in parallel.
 #
 # qwickapps/slack-mcp-server`s legacy single-binary caller (deploy.yml)
@@ -167,7 +172,10 @@ jobs:
           esac
 
           # Mask everything before any line writes to disk so a stray echo
-          # cannot surface a secret in the action log.
+          # cannot surface a secret in the action log. ::add-mask:: is for
+          # high-entropy secrets (UUIDs, base64 keys, postgres URLs); a
+          # short literal string would mask every occurrence in any future
+          # log line forever, so do not extend this loop with such values.
           for v in "$BRIDGE_HMAC_KEY" "$TOKEN_ENCRYPTION_KEY" \
                    "$MULTIPLEXER_SERVICE_KEY" "$SETUP_SERVICE_KEY" \
                    "$DATABASE_URL" "$BRIDGE_URL" \
@@ -186,7 +194,7 @@ jobs:
             "BRIDGE_PORT=13081" \
             "PORT=13081" \
             "APP_NAME=slack-bridge" \
-            > /tmp/app-env-slack-bridge.env
+            > "/tmp/app-env-${ENV}-slack-bridge.env"
 
           # ── slack-multiplexer ───────────────────────────────────────────
           # Tailnet-only. Needs encryption key + service key + DATABASE_URL.
@@ -202,7 +210,7 @@ jobs:
             "TS_HOSTNAME=slack-multiplexer-${ENV}" \
             "TS_TAGS=tag:container" \
             "TS_API_KEY=${TS_API_KEY}" \
-            > /tmp/app-env-slack-multiplexer.env
+            > "/tmp/app-env-${ENV}-slack-multiplexer.env"
 
           # ── slack-setup ─────────────────────────────────────────────────
           # Tailnet-only admin install service. BRIDGE_URL is templated into
@@ -220,10 +228,10 @@ jobs:
             "TS_HOSTNAME=slack-setup-${ENV}" \
             "TS_TAGS=tag:container" \
             "TS_API_KEY=${TS_API_KEY}" \
-            > /tmp/app-env-slack-setup.env
+            > "/tmp/app-env-${ENV}-slack-setup.env"
 
           for f in slack-bridge slack-multiplexer slack-setup; do
-            echo "Wrote /tmp/app-env-${f}.env ($(wc -l < /tmp/app-env-${f}.env) lines)"
+            echo "Wrote /tmp/app-env-${ENV}-${f}.env ($(wc -l < "/tmp/app-env-${ENV}-${f}.env") lines)"
           done
 
   # ── Deploy each app via deploy-app.yml ─────────────────────────────────────
@@ -276,3 +284,33 @@ jobs:
       critical_subsystems:       ''
       warning_subsystems:        ''
       prod_critical_subsystems:  ''
+
+  # ── Wipe per-app env files from the runner /tmp ─────────────────────────
+  # Always runs (success, failure, or matrix abort). Plaintext secrets on
+  # /tmp would otherwise persist until the macmini reboots and be readable
+  # by anything else running on the runner. Per slack-mcp-server#11
+  # reviewer pass-2 real concern 1.
+  cleanup-env-files:
+    needs: [resolve-env, deploy]
+    if: always()
+    runs-on: [self-hosted, macmini]
+    steps:
+      - name: Remove per-app env files
+        env:
+          ENV: ${{ needs.resolve-env.outputs.environment }}
+        run: |
+          # `rm -f` is sufficient: the matrix jobs are the only readers of
+          # these files, and they completed (or aborted) by the time this
+          # job runs. shred is unavailable on macOS by default and the
+          # tighter "DOD-grade wipe" is overkill for the brief lifetime
+          # of these files. If a future maintainer wants overwrite-then-
+          # unlink, install gshred from coreutils on the runner first.
+          for app in slack-bridge slack-multiplexer slack-setup; do
+            f="/tmp/app-env-${ENV}-${app}.env"
+            if [ -f "$f" ]; then
+              rm -f "$f"
+              echo "Removed $f"
+            else
+              echo "Already gone: $f"
+            fi
+          done

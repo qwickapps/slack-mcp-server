@@ -103,7 +103,7 @@ on:
 
       # ── CMD override (qwickapps/mcp#84) ───────────────────────────────────────
       cmd:
-        description: 'Container CMD override (absolute binary path). Set when one image ships multiple binaries and the CapRover app picks one — written to serviceUpdateOverride. Empty leaves any existing override untouched.'
+        description: 'Container CMD override (absolute binary path). Set when one image ships multiple binaries and the CapRover app picks one — written to serviceUpdateOverride. Empty leaves any existing override untouched. Pass the literal sentinel `__clear__` to clear an existing override (workflow inputs cannot disambiguate empty-string from unset).'
         type: string
         default: ''
 
@@ -331,18 +331,40 @@ jobs:
 
       - name: Configure build slot on CapRover
         run: |
-          ENV_FILE="/tmp/app-env-${{ inputs.app_name }}.env"
+          # Per slack-mcp-server#11 reviewer pass-2: env file path now
+          # includes the environment prefix so a uat run cannot overwrite
+          # a dev file (or vice versa) on a shared self-hosted runner.
+          # Caller workflow writes to /tmp/app-env-${ENV}-${APP}.env;
+          # legacy callers that wrote to /tmp/app-env-${APP}.env are
+          # checked as a fallback to ease the transition window.
+          ENV="${{ inputs.environment }}"
+          APP="${{ inputs.app_name }}"
+          ENV_FILE="/tmp/app-env-${ENV}-${APP}.env"
           if [ ! -f "$ENV_FILE" ]; then
-            echo "INFO: $ENV_FILE not found — app will keep its existing env vars"
-            # Minimal file so configure script does not fail
-            printf 'NODE_ENV=production\n' > "$ENV_FILE"
+            LEGACY="/tmp/app-env-${APP}.env"
+            if [ -f "$LEGACY" ]; then
+              echo "INFO: using legacy env path $LEGACY (caller has not adopted env-prefixed path yet)"
+              ENV_FILE="$LEGACY"
+            else
+              echo "INFO: $ENV_FILE not found — app will keep its existing env vars"
+              # Minimal file so configure script does not fail
+              printf 'NODE_ENV=production\n' > "$ENV_FILE"
+            fi
           fi
 
+          # Per slack-mcp-server#11 reviewer pass-2 nit 2: the
+          # workflow-input contract reserves the literal sentinel
+          # `__clear__` for "explicitly clear any existing CMD override".
+          # An empty `cmd:` input means "leave any existing override
+          # untouched" (default behavior on a fresh deploy with no
+          # CMD requirement). Without this sentinel a caller cannot
+          # request the clear path through the workflow boundary
+          # because empty strings cannot be distinguished from
+          # "input not set" at template-time.
           CMD_ARGS=()
-          # Only forward --cmd when the caller set it. Empty input means "no
-          # CMD override for this app" — leaves any existing serviceUpdateOverride
-          # on the build slot untouched (configure-caprover-app.sh's contract).
-          if [ -n "${{ inputs.cmd }}" ]; then
+          if [ "${{ inputs.cmd }}" = "__clear__" ]; then
+            CMD_ARGS=(--cmd "")
+          elif [ -n "${{ inputs.cmd }}" ]; then
             CMD_ARGS=(--cmd "${{ inputs.cmd }}")
           fi
 

@@ -238,7 +238,12 @@ copy_env_vars() {
     merged=$(echo "$merged" | jq --arg override "$svc_override" '.serviceUpdateOverride = $override')
   fi
 
-  echo "  Writing $var_count env vars to $dst"
+  if [ -n "$svc_override" ]; then
+    echo "  Writing $var_count env vars to $dst (and CMD override)"
+  else
+    echo "  Writing $var_count env vars to $dst"
+  fi
+
   local response
   response=$(caprover_api_call "Copy env vars to $dst" \
     curl -s -k -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
@@ -249,7 +254,11 @@ copy_env_vars() {
   local status
   status=$(echo "$response" | jq -r '.status')
   if [ "$status" = "100" ] || [ "$status" = "1000" ]; then
-    echo "  Env vars copied: $src -> $dst ($var_count vars)"
+    if [ -n "$svc_override" ]; then
+      echo "  Env vars copied: $src -> $dst ($var_count vars + CMD override)"
+    else
+      echo "  Env vars copied: $src -> $dst ($var_count vars)"
+    fi
   else
     echo "  Warning: env copy response: $(echo "$response" | jq -r '.description // "unknown"')"
   fi
