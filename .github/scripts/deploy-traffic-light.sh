@@ -143,11 +143,14 @@ fi
 
 case $ENVIRONMENT in
   dev)
-    # dev: single-slot environment — build IS the live slot.
-    # See https://github.com/qwickapps/slack/issues/20
-    APP_BUILD="${PRODUCT}"
-    APP_LIVE="${PRODUCT}"
-    APP_STABLE=""
+    # qwickapps/mcp#84: dev was historically single-slot (BUILD == LIVE,
+    # no STABLE). @raaj retired that path so dev now mirrors prod's full
+    # blue-green (build → live → stable). Same naming as prod; the slot
+    # apps live on the dev CapRover instance (captain.dev.qwickforge.com)
+    # so there is no name collision with prod.
+    APP_BUILD="${PRODUCT}-build"
+    APP_LIVE="${PRODUCT}-live"
+    APP_STABLE="${PRODUCT}-stable"
     DB_BRANCH="${DB_BRANCH_NAME:-${PRODUCT}-build}"
     ;;
   uat)
@@ -167,16 +170,6 @@ case $ENVIRONMENT in
     exit 1
     ;;
 esac
-
-# Dev: single-slot — no swap, no stable, no live-slot verify.
-# Build IS the live slot. All health checks already ran in deploy-and-verify.
-# See: https://github.com/qwickapps/slack/issues/20
-if [ "$ENVIRONMENT" = "dev" ]; then
-  echo "INFO: dev environment — single-slot, skipping swap and live-verify steps."
-  echo "Traffic Light Deployment Complete (dev, no-swap)"
-  echo "  Slot: $APP_BUILD already serving traffic"
-  exit 0
-fi
 
 echo "========================================="
 echo "Traffic Light Deployment"

@@ -88,9 +88,13 @@ fi
 
 case $ENVIRONMENT in
   dev)
-    APP_BUILD="${PRODUCT}"
-    APP_LIVE="${PRODUCT}-dev"
-    APP_STABLE=""
+    # qwickapps/mcp#84: dev now mirrors prod's full blue-green flow.
+    # The historical single-slot dev path (BUILD == LIVE, no STABLE)
+    # has been retired. Slot apps live on the dev CapRover instance,
+    # so the prod-style names cannot collide with prod.
+    APP_BUILD="${PRODUCT}-build"
+    APP_LIVE="${PRODUCT}-live"
+    APP_STABLE="${PRODUCT}-stable"
     ;;
   uat)
     APP_BUILD="${PRODUCT}-uat-build"
@@ -107,11 +111,6 @@ case $ENVIRONMENT in
     exit 1
     ;;
 esac
-
-if [ "$ENVIRONMENT" = "dev" ]; then
-  echo "INFO: dev environment — single-slot, swap is a no-op."
-  exit 0
-fi
 
 echo "========================================="
 echo "Swap Instances"
@@ -183,9 +182,51 @@ get_app_definition() {
     | jq --arg name "$app_name" '.data.appDefinitions[] | select(.appName == $name)'
 }
 
+ensure_app_exists() {
+  local app_name="$1"
+
+  if [ -z "$app_name" ]; then
+    return 0
+  fi
+
+  local existing
+  existing=$(get_app_definition "$app_name")
+  if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+    echo "  App exists: $app_name"
+    return 0
+  fi
+
+  echo "  Creating app slot: $app_name"
+  local response
+  response=$(caprover_api_call "Create app slot $app_name" \
+    curl -s -k -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/register" \
+    -H "Content-Type: application/json" \
+    -H "x-captain-auth: $TOKEN" \
+    -d "$(jq -n --arg app "$app_name" '{appName: $app, hasPersistentData: false}')")
+
+  local status desc
+  status=$(echo "$response" | jq -r '.status')
+  desc=$(echo "$response" | jq -r '.description // ""')
+  if [ "$status" = "100" ] || [ "$status" = "1901" ] || echo "$desc" | grep -qi "already"; then
+    echo "  App slot ready: $app_name"
+  else
+    echo "  Error: failed to create app slot $app_name: $desc (status: $status)"
+    exit 1
+  fi
+}
+
 # Issue #13: copy envVars from $1 (source app) into $2 (target app) via the
 # appDefinitions/update endpoint. Read-then-write: target's other fields are
-# preserved. No-op (with warning) when source has zero env vars.
+# preserved. No-op (with warning) when source has zero env vars and no CMD
+# override.
+#
+# qwickapps/mcp#84: also carry over `serviceUpdateOverride` (the CMD override
+# slot used when one image ships multiple binaries) so that an override
+# written on the build slot via configure-caprover-app.sh --cmd survives
+# promotion into live and stable. Without this, only the image is deployed
+# forward; the live app would inherit whatever (or no) CMD was on its
+# definition, and a multi-binary image layout would silently run the wrong
+# binary in the live slot.
 copy_env_vars() {
   local src="$1"
   local dst="$2"
@@ -203,8 +244,14 @@ copy_env_vars() {
   local var_count
   var_count=$(echo "$env_vars" | jq 'length')
 
-  if [ "$var_count" = "0" ]; then
-    echo "  Warning: source $src has 0 env vars, skipping copy (target $dst may fail to start)"
+  # serviceUpdateOverride is a YAML string ("" when unset). Only carry it
+  # forward when non-empty on the source — copying "" could silently clear
+  # an override an operator set directly on dst.
+  local svc_override
+  svc_override=$(echo "$src_def" | jq -r '.serviceUpdateOverride // ""')
+
+  if [ "$var_count" = "0" ] && [ -z "$svc_override" ]; then
+    echo "  Warning: source $src has 0 env vars and no CMD override, skipping copy (target $dst may fail to start)"
     return 0
   fi
 
@@ -219,7 +266,17 @@ copy_env_vars() {
   local merged
   merged=$(echo "$dst_def" | jq --argjson vars "$env_vars" '.envVars = $vars')
 
-  echo "  Writing $var_count env vars to $dst"
+  if [ -n "$svc_override" ]; then
+    echo "  Carrying CMD override (serviceUpdateOverride) forward"
+    merged=$(echo "$merged" | jq --arg override "$svc_override" '.serviceUpdateOverride = $override')
+  fi
+
+  if [ -n "$svc_override" ]; then
+    echo "  Writing $var_count env vars to $dst (and CMD override)"
+  else
+    echo "  Writing $var_count env vars to $dst"
+  fi
+
   local response
   response=$(caprover_api_call "Copy env vars to $dst" \
     curl -s -k -X POST "$CAPROVER_URL/api/v2/user/apps/appDefinitions/update" \
@@ -230,7 +287,11 @@ copy_env_vars() {
   local status
   status=$(echo "$response" | jq -r '.status')
   if [ "$status" = "100" ] || [ "$status" = "1000" ]; then
-    echo "  Env vars copied: $src -> $dst ($var_count vars)"
+    if [ -n "$svc_override" ]; then
+      echo "  Env vars copied: $src -> $dst ($var_count vars + CMD override)"
+    else
+      echo "  Env vars copied: $src -> $dst ($var_count vars)"
+    fi
   else
     echo "  Warning: env copy response: $(echo "$response" | jq -r '.description // "unknown"')"
   fi
@@ -341,11 +402,13 @@ if [ "$DIRECTION" = "promote" ]; then
 
   echo ""
   echo "Step 2a: Copy env vars from $APP_BUILD to $APP_LIVE (issue #13)..."
+  ensure_app_exists "$APP_LIVE"
   copy_env_vars "$APP_BUILD" "$APP_LIVE"
 
   if [ -n "$APP_STABLE" ]; then
     echo ""
     echo "Step 2b: Copy env vars from $APP_BUILD to $APP_STABLE (issue #13)..."
+    ensure_app_exists "$APP_STABLE"
     copy_env_vars "$APP_BUILD" "$APP_STABLE"
   fi
 

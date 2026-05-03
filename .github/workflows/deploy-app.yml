@@ -46,6 +46,11 @@ on:
         type: string
         default: 'schema,logging,auth,react-framework,auth-client,cms,server'
 
+      image_ref:
+        description: 'Optional prebuilt image ref to deploy. When set, this workflow skips its build job and deploys the provided image. Used by the three-app caller to share one Docker build across multiple CapRover apps.'
+        type: string
+        default: ''
+
       container_port:
         description: 'Container port the app listens on. REQUIRED — pass explicitly from caller.'
         type: string
@@ -101,6 +106,12 @@ on:
         type: string
         default: ''
 
+      # ── CMD override (qwickapps/mcp#84) ───────────────────────────────────────
+      cmd:
+        description: 'Container CMD override (absolute binary path). Set when one image ships multiple binaries and the CapRover app picks one — written to serviceUpdateOverride. Empty leaves any existing override untouched. Pass the literal sentinel `__clear__` to clear an existing override (workflow inputs cannot disambiguate empty-string from unset).'
+        type: string
+        default: ''
+
 env:
   REGISTRY: ghcr.io
   OWNER: qwickapps
@@ -135,7 +146,11 @@ jobs:
           TAG="${VERSION}.${{ github.run_number }}"
           ENV="${{ inputs.environment }}"
           APP="${{ inputs.app_name }}"
-          IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/img-${APP}-${ENV}:${TAG}"
+          if [ -n "${{ inputs.image_ref }}" ]; then
+            IMAGE="${{ inputs.image_ref }}"
+          else
+            IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/img-${APP}-${ENV}:${TAG}"
+          fi
 
           case "$ENV" in
             prod)
@@ -149,11 +164,14 @@ jobs:
               STABLE_APP="${APP}-uat-stable"
               ;;
             *)
-              # dev: single-slot environment — build IS the live slot.
-              # See: https://github.com/qwickapps/slack/issues/20
-              BUILD_APP="${APP}"
-              LIVE_APP="${APP}"
-              STABLE_APP=""
+              # qwickapps/mcp#84: dev now mirrors prod's full blue-green
+              # (build → live → stable). The historical single-slot path
+              # (issue qwickapps/slack#20) is retired. Slot apps live on
+              # the dev CapRover instance, so the prod-style names cannot
+              # collide with prod.
+              BUILD_APP="${APP}-build"
+              LIVE_APP="${APP}-live"
+              STABLE_APP="${APP}-stable"
               ;;
           esac
 
@@ -183,10 +201,11 @@ jobs:
               LIVE_APP_URL="https://${LIVE_APP}.app.qwickforge.com"
               ;;
             *)
-              # dev: single-slot — live URL == build URL. See issue #20.
+              # qwickapps/mcp#84: dev is now blue-green; verify against
+              # the build slot, route gateway at the live slot.
               APP_URL="https://${BUILD_APP}.dev.qwickforge.com"
               GATEWAY_APP_NAME="${APP}-dev"
-              LIVE_APP_URL="${APP_URL}"
+              LIVE_APP_URL="https://${LIVE_APP}.dev.qwickforge.com"
               ;;
           esac
 
@@ -197,6 +216,7 @@ jobs:
   # ── Phase 1: Build & push Docker image ───────────────────────────────────────
   build:
     needs: prepare
+    if: inputs.image_ref == ''
     runs-on: [self-hosted, macmini]
     # GHCR push uses GHCR_PUSH_TOKEN PAT (see "Login to GHCR" step) — we don't
     # need elevated GITHUB_TOKEN packages:write, which the qwickapps org policy
@@ -282,6 +302,10 @@ jobs:
   # skips env update and just ensures the app exists.
   provision-app:
     needs: [prepare, build]
+    if: |
+      always() &&
+      needs.prepare.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: [self-hosted, macmini]
     concurrency:
       group: caprover-provision-${{ inputs.app_name }}-${{ inputs.environment }}
@@ -321,22 +345,58 @@ jobs:
 
       - name: Configure build slot on CapRover
         run: |
-          ENV_FILE="/tmp/app-env-${{ inputs.app_name }}.env"
+          # Per slack-mcp-server#11 reviewer pass-2: env file path now
+          # includes the environment prefix so a uat run cannot overwrite
+          # a dev file (or vice versa) on a shared self-hosted runner.
+          # Caller workflow writes to /tmp/app-env-${ENV}-${APP}.env;
+          # legacy callers that wrote to /tmp/app-env-${APP}.env are
+          # checked as a fallback to ease the transition window.
+          ENV="${{ inputs.environment }}"
+          APP="${{ inputs.app_name }}"
+          ENV_FILE="/tmp/app-env-${ENV}-${APP}.env"
           if [ ! -f "$ENV_FILE" ]; then
-            echo "INFO: $ENV_FILE not found — app will keep its existing env vars"
-            # Minimal file so configure script does not fail
-            printf 'NODE_ENV=production\n' > "$ENV_FILE"
+            LEGACY="/tmp/app-env-${APP}.env"
+            if [ -f "$LEGACY" ]; then
+              echo "INFO: using legacy env path $LEGACY (caller has not adopted env-prefixed path yet)"
+              ENV_FILE="$LEGACY"
+            else
+              echo "INFO: $ENV_FILE not found — app will keep its existing env vars"
+              # Minimal file so configure script does not fail
+              printf 'NODE_ENV=production\n' > "$ENV_FILE"
+            fi
           fi
+
+          # Per slack-mcp-server#11 reviewer pass-2 nit 2: the
+          # workflow-input contract reserves the literal sentinel
+          # `__clear__` for "explicitly clear any existing CMD override".
+          # An empty `cmd:` input means "leave any existing override
+          # untouched" (default behavior on a fresh deploy with no
+          # CMD requirement). Without this sentinel a caller cannot
+          # request the clear path through the workflow boundary
+          # because empty strings cannot be distinguished from
+          # "input not set" at template-time.
+          CMD_ARGS=()
+          if [ "${{ inputs.cmd }}" = "__clear__" ]; then
+            CMD_ARGS=(--cmd "")
+          elif [ -n "${{ inputs.cmd }}" ]; then
+            CMD_ARGS=(--cmd "${{ inputs.cmd }}")
+          fi
+
           .github/scripts/configure-caprover-app.sh \
             --app-name         "${{ needs.prepare.outputs.build_app }}" \
             --caprover-url     "$CAPROVER_URL" \
             --caprover-password "$CAPROVER_PASSWORD" \
             --container-port   "${{ inputs.container_port }}" \
-            --env-file         "$ENV_FILE"
+            --env-file         "$ENV_FILE" \
+            "${CMD_ARGS[@]}"
 
   # ── Phase 1.5 (parallel with build): Provision gateway route ─────────────────
   provision-gateway:
     needs: [prepare, build]
+    if: |
+      always() &&
+      needs.prepare.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: [self-hosted, macmini]
     continue-on-error: true
     concurrency:
@@ -377,8 +437,9 @@ jobs:
   deploy-and-verify:
     needs: [prepare, build, provision-app, provision-gateway]
     if: |
+      always() &&
       needs.prepare.result == 'success' &&
-      needs.build.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
       needs.provision-app.result == 'success' &&
       (needs.provision-gateway.result == 'success' || needs.provision-gateway.result == 'skipped')
     runs-on: [self-hosted, macmini]
@@ -556,8 +617,9 @@ jobs:
   traffic-light-deploy:
     needs: [prepare, build, provision-app, provision-gateway, deploy-and-verify]
     if: |
+      always() &&
       needs.prepare.result == 'success' &&
-      needs.build.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
       needs.provision-app.result == 'success' &&
       needs.deploy-and-verify.result == 'success'
     runs-on: [self-hosted, macmini]

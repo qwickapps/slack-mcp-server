@@ -20,22 +20,23 @@ push to master
               └── traffic-light-deploy
 ```
 
-### Manual promotion (prod/uat only)
+### Manual promotion
 
-After `deploy.yml` completes for `prod` or `uat`, run the promote workflows
-in order:
+After `deploy.yml` or `deploy-three-apps.yml` completes, run the promote
+workflows in order when an operator wants to advance a specific app manually:
 
 ```
-promote-to-live.yml   (image_ref + environment)
+promote-to-live.yml   (app_name + image_ref + environment)
   └── validates image_ref format
-  └── deploys to <app>-live (prod) or <app>-uat (uat) slot
-  └── health checks /sse (15 attempts x 20s)
+  └── promotes <app>-build to <app>-live (dev/prod) or <app>-uat (uat)
+  └── health checks /sse for slack-mcp-server, /_health for the three P3 apps
   └── Telegram notification with image_ref to paste into stable step
 
-promote-to-stable.yml (same image_ref + environment)
+promote-to-stable.yml (same app_name + image_ref + environment)
   └── tags image as stable-<version>-<short_sha> + stable-latest in GHCR
-  └── deploys to <app>-stable (prod) or <app>-uat-stable (uat) slot
-  └── health checks /sse
+  └── copies live env vars + CMD override to stable
+  └── deploys to <app>-stable (dev/prod) or <app>-uat-stable (uat)
+  └── health checks /sse for slack-mcp-server, /_health for the three P3 apps
   └── Telegram notification — stable slot is now rollback target
 ```
 
@@ -45,11 +46,14 @@ promote-to-stable.yml (same image_ref + environment)
 
 | Environment | Build slot | Live slot | Stable slot |
 |-------------|------------|-----------|-------------|
-| dev | `slack-mcp-server` | `slack-mcp-server-dev` | — |
+| dev | `<app>-build` | `<app>-live` | `<app>-stable` |
 | uat | `slack-mcp-server-uat-build` | `slack-mcp-server-uat` | `slack-mcp-server-uat-stable` |
 | prod | `slack-mcp-server-build` | `slack-mcp-server-live` | `slack-mcp-server-stable` |
 
-Dev uses the build slot directly (no promote step).
+The P3 caller deploys `slack-bridge`, `slack-multiplexer`, and `slack-setup`
+with the same slot pattern. `deploy-three-apps.yml` builds one shared
+`img-slack-mcp-server-<env>` image and passes the immutable digest to each app
+deploy; each app selects its binary through the CapRover CMD override.
 
 ---
 

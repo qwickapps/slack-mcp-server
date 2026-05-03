@@ -16,7 +16,17 @@ set -euo pipefail
 #     --instance-count <count> \
 #     --container-port <port> \
 #     --force-ssl <true|false> \
-#     --env-file <path>
+#     --env-file <path> \
+#     [--cmd <binary-path>]
+#
+# --cmd writes a `serviceUpdateOverride` YAML stanza onto the app definition
+# that overrides the container CMD with the given binary path. CapRover does
+# not expose CMD as a first-class app field; serviceUpdateOverride is the
+# documented escape hatch (see qwickapps/mcp#84). Required when one image
+# ships multiple binaries and each CapRover app picks one via CMD (e.g.
+# token-bridge / multiplexer / setup all share Dockerfile.qwickapps in
+# qwickapps/slack-mcp-server). Pass an absolute binary path. Omit the flag
+# entirely to leave any existing override untouched; pass --cmd "" to clear.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=.github/scripts/lib/caprover-api.sh
@@ -38,6 +48,10 @@ PORTS_JSON=""
 DESCRIPTION=""
 ENV_FILE=""
 DOMAINS=""
+CMD=""
+# Distinguish "flag absent" from "flag passed empty" (= clear override).
+# Bash exposes no native sentinel for that, so we track it ourselves.
+CMD_SET="false"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -101,6 +115,11 @@ while [[ $# -gt 0 ]]; do
       DOMAINS="$2"
       shift 2
       ;;
+    --cmd)
+      CMD="$2"
+      CMD_SET="true"
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
       exit 1
@@ -122,6 +141,9 @@ echo "Instance Count: $INSTANCE_COUNT"
 echo "Container Port: $CONTAINER_PORT"
 echo "Force SSL: $FORCE_SSL"
 [[ -n "$NOT_EXPOSE_AS_WEB_APP" ]] && echo "Internal Service: $NOT_EXPOSE_AS_WEB_APP"
+if [ "$CMD_SET" = "true" ]; then
+  echo "CMD Override: ${CMD:-<clear>}"
+fi
 echo "========================================="
 
 # Authenticate with CapRover
@@ -210,6 +232,28 @@ fi
 
 if [ -n "$PORTS_JSON" ]; then
   MERGED=$(echo "$MERGED" | jq --argjson ports "$PORTS_JSON" '.ports = $ports')
+fi
+
+# Apply CMD override via serviceUpdateOverride. The field is a YAML *string*
+# embedded inside the JSON definition — CapRover parses it server-side and
+# merges into the SwarmKit ServiceSpec on the next deploy. See:
+#   https://caprover.com/docs/service-update-override.html
+# Only the relevant keys are written; we intentionally do NOT carry over any
+# previous serviceUpdateOverride content because the override applies to the
+# whole TaskTemplate slice and partial-merging YAML at the app level would
+# silently lose other fields a future maintainer might add. If the operator
+# needs additional override fields, set them via this flag's input format.
+if [ "$CMD_SET" = "true" ]; then
+  if [ -z "$CMD" ]; then
+    echo ""
+    echo "Clearing serviceUpdateOverride (--cmd \"\")..."
+    MERGED=$(echo "$MERGED" | jq '.serviceUpdateOverride = ""')
+  else
+    echo ""
+    echo "Setting CMD override via serviceUpdateOverride: $CMD"
+    CMD_YAML=$(printf 'TaskTemplate:\n  ContainerSpec:\n    Command:\n      - %s\n' "$CMD")
+    MERGED=$(echo "$MERGED" | jq --arg yaml "$CMD_YAML" '.serviceUpdateOverride = $yaml')
+  fi
 fi
 
 # Merge environment variables if env file provided
