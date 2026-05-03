@@ -42,7 +42,10 @@ type Cipher struct {
 func DecodeKey(b64 string) ([]byte, error) {
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
-		return nil, fmt.Errorf("base64 decode: %w", err)
+		raw, err = base64.RawStdEncoding.DecodeString(b64)
+		if err != nil {
+			return nil, fmt.Errorf("base64 decode: %w", err)
+		}
 	}
 	if len(raw) != EncryptionKeyBytes {
 		return nil, ErrKeyLength

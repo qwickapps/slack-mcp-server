@@ -40,6 +40,14 @@ func TestDecodeKey_AcceptsValid32Bytes(t *testing.T) {
 	assert.Equal(t, raw, out)
 }
 
+func TestDecodeKey_AcceptsUnpaddedValid32Bytes(t *testing.T) {
+	raw := newTestKey(t)
+	b64 := base64.RawStdEncoding.EncodeToString(raw)
+	out, err := DecodeKey(b64)
+	require.NoError(t, err)
+	assert.Equal(t, raw, out)
+}
+
 func TestNewCipher_RejectsWrongKeyLength(t *testing.T) {
 	_, err := NewCipher(make([]byte, 16))
 	assert.ErrorIs(t, err, ErrKeyLength)
