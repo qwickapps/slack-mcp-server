@@ -87,10 +87,6 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 #   - setup service (Tailscale-only, P4):       CMD ["/usr/local/bin/setup"]
 CMD ["/usr/local/bin/mcp-server", "--transport", "sse"]
 
-# The SSE endpoint at /sse is the liveness indicator for the MCP server.
-# curl exit 28 (operation timeout) means the connection was established and the server
-# returned 200 OK but kept the stream open — that is healthy. Exit 0 is also healthy.
-# Any other exit code (7=connection refused, 22=HTTP error, etc.) is unhealthy.
-# Shell form (sh -c) is required so ${SLACK_MCP_PORT} expands at runtime.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD sh -c 'curl -fsS --max-time 2 http://localhost:${SLACK_MCP_PORT}/sse >/dev/null 2>&1; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 28 ]'
+# Do not define an image-level Docker HEALTHCHECK here. This image backs
+# multiple CapRover apps with different CMD overrides and health endpoints;
+# deploy-app.yml configures each app's own healthPath (for example /_health).
