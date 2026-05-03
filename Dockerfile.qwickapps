@@ -29,6 +29,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/token-bridge ./cmd/token-bridge
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/multiplexer ./cmd/multiplexer
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/setup ./cmd/setup
 
 # qwickapps-base ships node + curl + tailscale + ca-certificates (see qwickapps/node Dockerfile).
 # If a future base rebuild drops these, the build below will fail loudly — that is the desired failure mode.
@@ -46,6 +47,10 @@ COPY --from=builder /out/token-bridge /usr/local/bin/token-bridge
 # QwickApps multiplexer (see cmd/multiplexer). Fronts per-team mcp-server
 # children; selected via CMD override at the CapRover-app level.
 COPY --from=builder /out/multiplexer /usr/local/bin/multiplexer
+
+# QwickApps setup service (see cmd/setup). Tailscale-only install page that
+# templates the userscript; selected via CMD override at the CapRover-app level.
+COPY --from=builder /out/setup /usr/local/bin/setup
 
 # SQL migrations applied by token-bridge on startup.
 COPY --from=builder /src/migrations /app/migrations
@@ -67,6 +72,9 @@ ENV PORT=13080 \
 EXPOSE 13080
 # 13082 is the multiplexer's HTTP listen port (MULTIPLEXER_PORT env var).
 EXPOSE 13082
+# 13083 is the setup service's HTTP listen port (SETUP_PORT env var). Tailscale-only;
+# never wire a public CapRover proxy rule to this port.
+EXPOSE 13083
 
 # entrypoint.sh sets up Tailscale + Tailscale Serve, then exec's CMD.
 ENTRYPOINT ["/app/entrypoint.sh"]
@@ -76,6 +84,7 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 #   - upstream mcp-server (SSE, single-tenant): CMD ["/usr/local/bin/mcp-server", "--transport", "sse"]
 #   - token-bridge sidecar:                     CMD ["/usr/local/bin/token-bridge"]
 #   - multiplexer (multi-tenant, P3):           CMD ["/usr/local/bin/multiplexer"]
+#   - setup service (Tailscale-only, P4):       CMD ["/usr/local/bin/setup"]
 CMD ["/usr/local/bin/mcp-server", "--transport", "sse"]
 
 # The SSE endpoint at /sse is the liveness indicator for the MCP server.

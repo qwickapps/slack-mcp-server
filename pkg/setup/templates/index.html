@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QwickApps Slack Bridge — Setup</title>
+  <style>
+    body { font-family: sans-serif; max-width: 860px; margin: 40px auto; padding: 0 20px; color: #222; }
+    h1 { font-size: 1.4rem; margin-bottom: 4px; }
+    p.note { font-size: 0.85rem; color: #666; margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; margin: 24px 0; }
+    th, td { text-align: left; padding: 8px 12px; border: 1px solid #ddd; font-size: 0.9rem; }
+    th { background: #f5f5f5; }
+    .fresh { color: #2a7a2a; }
+    .stale { color: #b85c00; }
+    .install { display: inline-block; margin: 16px 0; padding: 10px 20px; background: #2563eb; color: #fff; text-decoration: none; border-radius: 4px; font-size: 0.95rem; }
+    .install:hover { background: #1d4ed8; }
+    pre { background: #f5f5f5; padding: 14px; border-radius: 4px; font-size: 0.82rem; overflow-x: auto; }
+    hr { border: none; border-top: 1px solid #e5e5e5; margin: 32px 0; }
+  </style>
+</head>
+<body>
+  <h1>QwickApps Slack Bridge — Setup</h1>
+  <p class="note">Internal tool. Tailscale-only. Do not expose to the public internet.</p>
+
+  <h2>Workspace Status</h2>
+  {{if .Workspaces}}
+  <table>
+    <thead>
+      <tr><th>Team ID</th><th>Team Name</th><th>Last Refreshed</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      {{range .Workspaces}}
+      <tr>
+        <td>{{.TeamID}}</td>
+        <td>{{.TeamName}}</td>
+        <td>{{.LastRefreshedAt.Format "2006-01-02 15:04:05 UTC"}}</td>
+        <td>{{if .Fresh}}<span class="fresh">fresh</span>{{else}}<span class="stale">stale (&gt;1h)</span>{{end}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p>No workspaces have refreshed yet. Install the userscript below, then open Slack in your browser.</p>
+  {{end}}
+
+  <hr>
+
+  <h2>Install Userscript</h2>
+  <p>Install <a href="https://www.tampermonkey.net/" target="_blank">Tampermonkey</a> in your browser. The userscript endpoint requires bearer auth, so a plain link click cannot trigger an install — download with <code>curl</code> and open the saved file, which Tampermonkey will then offer to install:</p>
+  <pre>curl -fsSL \
+  -H "Authorization: Bearer $SETUP_SERVICE_KEY" \
+  -o qwickapps-slack-bridge.user.js \
+  {{.SetupURL}}/userscript.user.js
+
+# Then drag the saved .user.js onto Tampermonkey's dashboard,
+# or open the file:// path in your browser.</pre>
+  <p style="font-size:0.85rem;color:#666;">The downloaded <code>.user.js</code> is pre-configured with this deployment's <code>BRIDGE_URL</code> and <code>BRIDGE_HMAC_KEY</code>.</p>
+
+  <hr>
+
+  <h2>First-Time HMAC Key Setup</h2>
+  <p>Generate a random 32-byte key and set it in the environment before deploying:</p>
+  <pre>openssl rand -hex 32</pre>
+  <p>Set the output as <code>BRIDGE_HMAC_KEY</code> in both the <strong>token-bridge</strong> service and this <strong>setup</strong> service. They must share the same value.</p>
+  <p>Set <code>SETUP_SERVICE_KEY</code> to a separate random value used to authenticate access to this page.</p>
+</body>
+</html>

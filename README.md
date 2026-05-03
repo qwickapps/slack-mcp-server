@@ -410,3 +410,52 @@ go test ./pkg/multiplexer/... -timeout 30s
 # Integration tests (DBReader, real DB):
 TEST_DATABASE_URL=postgres://... go test ./pkg/multiplexer/... -timeout 60s
 ```
+
+---
+
+## Setup Service
+
+The setup service (`cmd/setup`) is a small Tailscale-only HTTP service (port `13083`) that provides an install page for the Tampermonkey userscript. It templates the userscript with deployment-specific `BRIDGE_URL` and `BRIDGE_HMAC_KEY` values at request time.
+
+**Security requirement:** this service must never be exposed to the public internet. Deploy it in a CapRover app configured to serve exclusively over Tailscale (no external proxy route). The HMAC key is never logged.
+
+### Endpoints
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/` | Bearer | Workspace status page with install button |
+| `GET` | `/userscript.user.js` | Bearer | Userscript with placeholders substituted |
+| `GET` | `/_health` | None | DB ping — 200 ok / 503 unhealthy |
+
+### Environment Variables
+
+- `DATABASE_URL` — Postgres connection string (shared with token-bridge)
+- `BRIDGE_URL` — fully-qualified URL of the deployed token-bridge (e.g. `https://slack-bridge.dev.qwickapps.com`)
+- `BRIDGE_HMAC_KEY` — HMAC key shared with the token-bridge; must match exactly
+- `SETUP_SERVICE_KEY` — bearer token for accessing the setup page; generate with `openssl rand -hex 32`
+- `SETUP_PORT` — listen port (default `13083`)
+- `SETUP_HOST` — listen host (default `0.0.0.0`)
+
+### First-Time Setup
+
+1. Generate a shared HMAC key: `openssl rand -hex 32` — set as `BRIDGE_HMAC_KEY` in both the token-bridge app and this service.
+2. Generate a setup key: `openssl rand -hex 32` — set as `SETUP_SERVICE_KEY`.
+3. From an authenticated terminal on the Tailnet, download the templated userscript (a plain browser link click will not include the bearer header):
+   ```sh
+   curl -fsSL \
+     -H "Authorization: Bearer $SETUP_SERVICE_KEY" \
+     -o qwickapps-slack-bridge.user.js \
+     https://<tailscale-host>:13083/userscript.user.js
+   ```
+4. Drag the saved `.user.js` onto the Tampermonkey dashboard (or open the `file://` path in your browser). Tampermonkey will offer to install it.
+5. Open Slack in the same browser. The userscript captures `xoxc`/`xoxd` and posts them silently to the token-bridge. Visit `https://<tailscale-host>:13083/` (with `Authorization: Bearer $SETUP_SERVICE_KEY`) to see workspace status.
+
+### Tests
+
+```sh
+go vet ./pkg/setup/... ./cmd/setup/...
+go test ./pkg/setup/... -timeout 30s -race
+
+# DB integration tests (skipped without TEST_DATABASE_URL):
+TEST_DATABASE_URL=postgres://... go test ./pkg/setup/... -timeout 60s
+```
