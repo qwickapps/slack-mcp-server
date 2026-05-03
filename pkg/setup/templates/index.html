@@ -47,9 +47,15 @@
   <hr>
 
   <h2>Install Userscript</h2>
-  <p>Install <a href="https://www.tampermonkey.net/" target="_blank">Tampermonkey</a> in your browser, then click below to install the QwickApps Slack Bridge userscript.</p>
-  <a class="install" href="/userscript.user.js">Install Userscript</a>
-  <p style="font-size:0.85rem;color:#666;">The link serves a pre-configured <code>.user.js</code> file. Tampermonkey will prompt for confirmation.</p>
+  <p>Install <a href="https://www.tampermonkey.net/" target="_blank">Tampermonkey</a> in your browser. The userscript endpoint requires bearer auth, so a plain link click cannot trigger an install — download with <code>curl</code> and open the saved file, which Tampermonkey will then offer to install:</p>
+  <pre>curl -fsSL \
+  -H "Authorization: Bearer $SETUP_SERVICE_KEY" \
+  -o qwickapps-slack-bridge.user.js \
+  {{.SetupURL}}/userscript.user.js
+
+# Then drag the saved .user.js onto Tampermonkey's dashboard,
+# or open the file:// path in your browser.</pre>
+  <p style="font-size:0.85rem;color:#666;">The downloaded <code>.user.js</code> is pre-configured with this deployment's <code>BRIDGE_URL</code> and <code>BRIDGE_HMAC_KEY</code>.</p>
 
   <hr>
 

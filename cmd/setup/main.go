@@ -51,8 +51,11 @@ func run() error {
 	}
 	defer db.Close()
 
-	db.SetMaxOpenConns(5)
-	db.SetMaxIdleConns(2)
+	// Setup is an interactive install-time tool used by one operator at a
+	// time on the Tailnet. A small pool is sufficient and avoids holding
+	// idle connections against qwickapps-db.
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)

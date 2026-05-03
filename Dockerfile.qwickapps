@@ -72,6 +72,9 @@ ENV PORT=13080 \
 EXPOSE 13080
 # 13082 is the multiplexer's HTTP listen port (MULTIPLEXER_PORT env var).
 EXPOSE 13082
+# 13083 is the setup service's HTTP listen port (SETUP_PORT env var). Tailscale-only;
+# never wire a public CapRover proxy rule to this port.
+EXPOSE 13083
 
 # entrypoint.sh sets up Tailscale + Tailscale Serve, then exec's CMD.
 ENTRYPOINT ["/app/entrypoint.sh"]

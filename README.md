@@ -440,9 +440,15 @@ The setup service (`cmd/setup`) is a small Tailscale-only HTTP service (port `13
 
 1. Generate a shared HMAC key: `openssl rand -hex 32` — set as `BRIDGE_HMAC_KEY` in both the token-bridge app and this service.
 2. Generate a setup key: `openssl rand -hex 32` — set as `SETUP_SERVICE_KEY`.
-3. Open the setup page in your browser over Tailscale: `https://<tailscale-host>:13083/` with `Authorization: Bearer <SETUP_SERVICE_KEY>`.
-4. Click **Install Userscript** — Tampermonkey will prompt for confirmation.
-5. Open Slack in the same browser. The userscript captures `xoxc`/`xoxd` and posts them silently to the token-bridge.
+3. From an authenticated terminal on the Tailnet, download the templated userscript (a plain browser link click will not include the bearer header):
+   ```sh
+   curl -fsSL \
+     -H "Authorization: Bearer $SETUP_SERVICE_KEY" \
+     -o qwickapps-slack-bridge.user.js \
+     https://<tailscale-host>:13083/userscript.user.js
+   ```
+4. Drag the saved `.user.js` onto the Tampermonkey dashboard (or open the `file://` path in your browser). Tampermonkey will offer to install it.
+5. Open Slack in the same browser. The userscript captures `xoxc`/`xoxd` and posts them silently to the token-bridge. Visit `https://<tailscale-host>:13083/` (with `Authorization: Bearer $SETUP_SERVICE_KEY`) to see workspace status.
 
 ### Tests
 

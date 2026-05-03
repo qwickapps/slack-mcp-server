@@ -15,10 +15,14 @@ import (
 // fakeReader is a test double for WorkspaceStatusReader.
 type fakeReader struct {
 	workspaces []setup.WorkspaceStatus
+	listErr    error
 	pingErr    error
 }
 
 func (f *fakeReader) ListWorkspaces(_ context.Context) ([]setup.WorkspaceStatus, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return f.workspaces, nil
 }
 
@@ -101,7 +105,7 @@ func TestUserscriptEndpointSubstitution(t *testing.T) {
 	body := rr.Body.String()
 
 	// Placeholders must be replaced.
-	for _, p := range []string{"__BRIDGE_URL__", "__BRIDGE_HMAC_KEY__"} {
+	for _, p := range []string{"__BRIDGE_URL__", "__BRIDGE_HMAC_KEY__", "__BRIDGE_HOST__"} {
 		if strings.Contains(body, p) {
 			t.Errorf("placeholder %q was not substituted in served userscript", p)
 		}
@@ -113,6 +117,10 @@ func TestUserscriptEndpointSubstitution(t *testing.T) {
 	}
 	if !strings.Contains(body, testHMACKey) {
 		t.Errorf("expected BRIDGE_HMAC_KEY %q in served userscript", testHMACKey)
+	}
+	// Host portion (without scheme) is what feeds @connect.
+	if !strings.Contains(body, "bridge.example.com") {
+		t.Errorf("expected bridge host 'bridge.example.com' in @connect directive")
 	}
 
 	ct := rr.Header().Get("Content-Type")
@@ -227,3 +235,52 @@ var errFakePing = &fakeError{"db ping failed"}
 type fakeError struct{ msg string }
 
 func (e *fakeError) Error() string { return e.msg }
+
+// TestUserscriptEndpointAuth verifies that GET /userscript.user.js requires
+// bearer auth — the route serves BRIDGE_HMAC_KEY and must never respond
+// unauthenticated, regardless of refactors to the auth middleware.
+func TestUserscriptEndpointAuth(t *testing.T) {
+	h := newTestHandler(t, &fakeReader{})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	t.Run("no auth header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/userscript.user.js", nil)
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", rr.Code)
+		}
+		if strings.Contains(rr.Body.String(), testHMACKey) {
+			t.Errorf("HMAC key leaked in unauthenticated response body")
+		}
+	})
+
+	t.Run("wrong token", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/userscript.user.js", nil)
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("expected 401, got %d", rr.Code)
+		}
+	})
+}
+
+// TestIndexListWorkspacesError verifies that a DB-level failure surfaces as
+// HTTP 500 rather than a partially rendered page.
+func TestIndexListWorkspacesError(t *testing.T) {
+	reader := &fakeReader{listErr: errFakePing}
+	h := newTestHandler(t, reader)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", rr.Code)
+	}
+}

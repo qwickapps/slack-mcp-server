@@ -21,6 +21,7 @@ func TestUserscriptPlaceholders(t *testing.T) {
 	placeholders := []string{
 		"__BRIDGE_URL__",
 		"__BRIDGE_HMAC_KEY__",
+		"__BRIDGE_HOST__",
 	}
 	for _, p := range placeholders {
 		if !strings.Contains(content, p) {

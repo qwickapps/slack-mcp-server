@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -105,9 +106,18 @@ func (h *Handler) handleIndex() http.Handler {
 			}
 		}
 
+		// Derive the public-facing URL of this setup service so the rendered
+		// install instructions can show a copy-pastable curl command.
+		scheme := "http"
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		setupURL := scheme + "://" + r.Host
+
 		data := struct {
 			Workspaces []row
-		}{Workspaces: rows}
+			SetupURL   string
+		}{Workspaces: rows, SetupURL: setupURL}
 
 		var buf bytes.Buffer
 		if err := h.tmpl.Execute(&buf, data); err != nil {
@@ -191,14 +201,11 @@ func bearerValid(r *http.Request, key string) bool {
 // bridgeHostFromURL extracts the host (with optional port) from a URL
 // string, for use in the Tampermonkey @connect directive.
 // E.g. "https://slack-bridge.dev.qwickapps.com" -> "slack-bridge.dev.qwickapps.com"
+// Falls back to the raw input if parsing fails or yields an empty host.
 func bridgeHostFromURL(rawURL string) string {
-	s := rawURL
-	if i := strings.Index(s, "://"); i >= 0 {
-		s = s[i+3:]
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
 	}
-	// Strip path/query/fragment.
-	if i := strings.IndexAny(s, "/?#"); i >= 0 {
-		s = s[:i]
-	}
-	return s
+	return u.Host
 }
