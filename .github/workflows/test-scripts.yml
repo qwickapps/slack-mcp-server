@@ -11,3 +11,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run deploy-traffic-light unit tests
         run: bash .github/scripts/test-deploy-traffic-light.sh
+
+  test-swap-instances:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run swap-instances unit tests
+        run: bash .github/scripts/tests/swap-instances.test.sh
+
+  test-configure-caprover-cmd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run configure-caprover-app --cmd flag tests
+        run: bash .github/scripts/tests/configure-caprover-cmd.test.sh

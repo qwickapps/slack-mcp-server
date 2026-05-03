@@ -101,6 +101,12 @@ on:
         type: string
         default: ''
 
+      # ── CMD override (qwickapps/mcp#84) ───────────────────────────────────────
+      cmd:
+        description: 'Container CMD override (absolute binary path). Set when one image ships multiple binaries and the CapRover app picks one — written to serviceUpdateOverride. Empty leaves any existing override untouched.'
+        type: string
+        default: ''
+
 env:
   REGISTRY: ghcr.io
   OWNER: qwickapps
@@ -149,11 +155,14 @@ jobs:
               STABLE_APP="${APP}-uat-stable"
               ;;
             *)
-              # dev: single-slot environment — build IS the live slot.
-              # See: https://github.com/qwickapps/slack/issues/20
-              BUILD_APP="${APP}"
-              LIVE_APP="${APP}"
-              STABLE_APP=""
+              # qwickapps/mcp#84: dev now mirrors prod's full blue-green
+              # (build → live → stable). The historical single-slot path
+              # (issue qwickapps/slack#20) is retired. Slot apps live on
+              # the dev CapRover instance, so the prod-style names cannot
+              # collide with prod.
+              BUILD_APP="${APP}-build"
+              LIVE_APP="${APP}-live"
+              STABLE_APP="${APP}-stable"
               ;;
           esac
 
@@ -183,10 +192,11 @@ jobs:
               LIVE_APP_URL="https://${LIVE_APP}.app.qwickforge.com"
               ;;
             *)
-              # dev: single-slot — live URL == build URL. See issue #20.
+              # qwickapps/mcp#84: dev is now blue-green; verify against
+              # the build slot, route gateway at the live slot.
               APP_URL="https://${BUILD_APP}.dev.qwickforge.com"
               GATEWAY_APP_NAME="${APP}-dev"
-              LIVE_APP_URL="${APP_URL}"
+              LIVE_APP_URL="https://${LIVE_APP}.dev.qwickforge.com"
               ;;
           esac
 
@@ -327,12 +337,22 @@ jobs:
             # Minimal file so configure script does not fail
             printf 'NODE_ENV=production\n' > "$ENV_FILE"
           fi
+
+          CMD_ARGS=()
+          # Only forward --cmd when the caller set it. Empty input means "no
+          # CMD override for this app" — leaves any existing serviceUpdateOverride
+          # on the build slot untouched (configure-caprover-app.sh's contract).
+          if [ -n "${{ inputs.cmd }}" ]; then
+            CMD_ARGS=(--cmd "${{ inputs.cmd }}")
+          fi
+
           .github/scripts/configure-caprover-app.sh \
             --app-name         "${{ needs.prepare.outputs.build_app }}" \
             --caprover-url     "$CAPROVER_URL" \
             --caprover-password "$CAPROVER_PASSWORD" \
             --container-port   "${{ inputs.container_port }}" \
-            --env-file         "$ENV_FILE"
+            --env-file         "$ENV_FILE" \
+            "${CMD_ARGS[@]}"
 
   # ── Phase 1.5 (parallel with build): Provision gateway route ─────────────────
   provision-gateway:

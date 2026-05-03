@@ -88,9 +88,13 @@ fi
 
 case $ENVIRONMENT in
   dev)
-    APP_BUILD="${PRODUCT}"
-    APP_LIVE="${PRODUCT}-dev"
-    APP_STABLE=""
+    # qwickapps/mcp#84: dev now mirrors prod's full blue-green flow.
+    # The historical single-slot dev path (BUILD == LIVE, no STABLE)
+    # has been retired. Slot apps live on the dev CapRover instance,
+    # so the prod-style names cannot collide with prod.
+    APP_BUILD="${PRODUCT}-build"
+    APP_LIVE="${PRODUCT}-live"
+    APP_STABLE="${PRODUCT}-stable"
     ;;
   uat)
     APP_BUILD="${PRODUCT}-uat-build"
@@ -107,11 +111,6 @@ case $ENVIRONMENT in
     exit 1
     ;;
 esac
-
-if [ "$ENVIRONMENT" = "dev" ]; then
-  echo "INFO: dev environment — single-slot, swap is a no-op."
-  exit 0
-fi
 
 echo "========================================="
 echo "Swap Instances"
@@ -185,7 +184,16 @@ get_app_definition() {
 
 # Issue #13: copy envVars from $1 (source app) into $2 (target app) via the
 # appDefinitions/update endpoint. Read-then-write: target's other fields are
-# preserved. No-op (with warning) when source has zero env vars.
+# preserved. No-op (with warning) when source has zero env vars and no CMD
+# override.
+#
+# qwickapps/mcp#84: also carry over `serviceUpdateOverride` (the CMD override
+# slot used when one image ships multiple binaries) so that an override
+# written on the build slot via configure-caprover-app.sh --cmd survives
+# promotion into live and stable. Without this, only the image is deployed
+# forward; the live app would inherit whatever (or no) CMD was on its
+# definition, and a multi-binary image layout would silently run the wrong
+# binary in the live slot.
 copy_env_vars() {
   local src="$1"
   local dst="$2"
@@ -203,8 +211,14 @@ copy_env_vars() {
   local var_count
   var_count=$(echo "$env_vars" | jq 'length')
 
-  if [ "$var_count" = "0" ]; then
-    echo "  Warning: source $src has 0 env vars, skipping copy (target $dst may fail to start)"
+  # serviceUpdateOverride is a YAML string ("" when unset). Only carry it
+  # forward when non-empty on the source — copying "" could silently clear
+  # an override an operator set directly on dst.
+  local svc_override
+  svc_override=$(echo "$src_def" | jq -r '.serviceUpdateOverride // ""')
+
+  if [ "$var_count" = "0" ] && [ -z "$svc_override" ]; then
+    echo "  Warning: source $src has 0 env vars and no CMD override, skipping copy (target $dst may fail to start)"
     return 0
   fi
 
@@ -218,6 +232,11 @@ copy_env_vars() {
 
   local merged
   merged=$(echo "$dst_def" | jq --argjson vars "$env_vars" '.envVars = $vars')
+
+  if [ -n "$svc_override" ]; then
+    echo "  Carrying CMD override (serviceUpdateOverride) forward"
+    merged=$(echo "$merged" | jq --arg override "$svc_override" '.serviceUpdateOverride = $override')
+  fi
 
   echo "  Writing $var_count env vars to $dst"
   local response

@@ -9,7 +9,9 @@
 # flags so the test does not depend on pnpm/playwright.
 #
 # Test cases:
-#   1. dev   — single-slot: must exit 0 and NOT call swap-instances.sh
+#   1. dev   — blue-green (qwickapps/mcp#84 retired single-slot dev): must
+#              call swap-instances.sh with --direction promote and
+#              build/live/stable slot names mirroring prod naming
 #   2. uat   — blue-green: must call swap-instances.sh with --direction promote
 #              and correct uat slot names
 #   3. prod  — blue-green: must call swap-instances.sh with correct prod slot names
@@ -123,29 +125,41 @@ record_fail() {
   echo "  FAIL: $name"
 }
 
-# ── Test 1: dev — single-slot, no swap ───────────────────────────────────────
+# ── Test 1: dev — blue-green (qwickapps/mcp#84) ──────────────────────────────
+# Single-slot dev was retired; dev now mirrors prod's full blue-green flow
+# with build → live → stable slots and prod-style naming.
 
-run_test "dev-no-swap" "dev"
+run_test "dev-blue-green" "dev"
 
 all_ok=true
 
-assert_not_contains "dev-no-swap: swap not called" \
+assert_contains "dev-blue-green: swap called" \
   "$LOG_DIR/calls.log" "MOCK swap-instances.sh" || all_ok=false
 
-assert_contains "dev-no-swap: single-slot message in stdout" \
+assert_contains "dev-blue-green: direction promote" \
+  "$LOG_DIR/calls.log" "--direction promote" || all_ok=false
+
+# Dev now uses prod-style slot naming on the dev CapRover instance.
+assert_contains "dev-blue-green: build slot" \
+  "$LOG_DIR/stdout.txt" "slack-mcp-server-build" || all_ok=false
+assert_contains "dev-blue-green: live slot" \
+  "$LOG_DIR/stdout.txt" "slack-mcp-server-live" || all_ok=false
+assert_contains "dev-blue-green: stable slot" \
+  "$LOG_DIR/stdout.txt" "slack-mcp-server-stable" || all_ok=false
+
+assert_not_contains "dev-blue-green: legacy single-slot message gone" \
   "$LOG_DIR/stdout.txt" "single-slot, skipping swap" || all_ok=false
 
-# Verify exit code was 0 using rc captured by run_test (avoids a second invocation)
 LAST_RC=$(cat "$LOG_DIR/last_rc")
 if [ "$LAST_RC" != "0" ]; then
-  echo "  FAIL [dev-no-swap: exit code]: expected 0, got $LAST_RC"
+  echo "  FAIL [dev-blue-green: exit code]: expected 0, got $LAST_RC"
   all_ok=false
 fi
 
 if [ "$all_ok" = "true" ]; then
-  record_pass "dev-no-swap"
+  record_pass "dev-blue-green"
 else
-  record_fail "dev-no-swap"
+  record_fail "dev-blue-green"
 fi
 
 # ── Test 2: uat — must call swap with --direction promote + correct slots ─────

@@ -23,10 +23,14 @@ trap 'rm -rf "$TMPDIR_TEST"' EXIT
 CALL_LOG="$TMPDIR_TEST/calls.log"
 : >"$CALL_LOG"
 
-# Mock CapRover state for the build slot. envVars are what we expect to copy.
+# Mock CapRover state. After qwickapps/mcp#84 dev follows the same
+# blue-green slot naming as prod — APP-build, APP-live, APP-stable —
+# so the fixture mirrors that. envVars are what we expect to copy
+# from build → live; serviceUpdateOverride is the new CMD-override
+# field that must also carry forward (#84 real concern).
 BUILD_DEFINITION_JSON=$(cat <<'JSON'
 {
-  "appName": "slack-mcp-server",
+  "appName": "slack-mcp-server-build",
   "envVars": [
     {"key": "DATABASE_URL", "value": "postgres://db"},
     {"key": "REDIS_URL", "value": "redis://r"},
@@ -34,18 +38,20 @@ BUILD_DEFINITION_JSON=$(cat <<'JSON'
   ],
   "hasDefaultSubDomainSsl": true,
   "forceSsl": true,
-  "websocketSupport": true
+  "websocketSupport": true,
+  "serviceUpdateOverride": "TaskTemplate:\n  ContainerSpec:\n    Command:\n      - /usr/local/bin/token-bridge\n"
 }
 JSON
 )
 
 LIVE_DEFINITION_JSON=$(cat <<'JSON'
 {
-  "appName": "slack-mcp-server-dev",
+  "appName": "slack-mcp-server-live",
   "envVars": [],
   "hasDefaultSubDomainSsl": false,
   "forceSsl": false,
-  "websocketSupport": false
+  "websocketSupport": false,
+  "serviceUpdateOverride": ""
 }
 JSON
 )
@@ -171,7 +177,7 @@ assert "update endpoint called for env copy" \
 
 # 2) An update payload referenced the live app and contains all 3 env keys
 ENV_UPDATE_LINE=$(grep 'appDefinitions/update' "$CALL_LOG" \
-  | grep 'slack-mcp-server-dev' \
+  | grep 'slack-mcp-server-live' \
   | grep '"envVars"' \
   | head -n 1 || true)
 
@@ -197,22 +203,41 @@ SSL_BODY_LINE=$(grep 'appDefinitions/enablebasedomainssl' "$CALL_LOG" | head -n 
 if [ -n "$SSL_BODY_LINE" ]; then
   SSL_PAYLOAD=$(printf '%s' "$SSL_BODY_LINE" | sed 's/.*data=//')
   assert "enablebasedomainssl payload targets live slot" \
-    bash -c "echo '$SSL_PAYLOAD' | jq -e '.appName == \"slack-mcp-server-dev\"' >/dev/null"
+    bash -c "echo '$SSL_PAYLOAD' | jq -e '.appName == \"slack-mcp-server-live\"' >/dev/null"
 fi
 
 # 3) forceSsl=true update was sent for the live slot
 FORCE_SSL_LINE=$(grep 'appDefinitions/update' "$CALL_LOG" \
-  | grep 'slack-mcp-server-dev' \
+  | grep 'slack-mcp-server-live' \
   | grep '"forceSsl":true' \
   | head -n 1 || true)
 assert "forceSsl=true update sent for live slot" \
   test -n "$FORCE_SSL_LINE"
 
+# qwickapps/mcp#84: serviceUpdateOverride must carry forward from build
+# to live during env-var copy. Without this, a CMD override written via
+# configure-caprover-app.sh --cmd would survive only on the build slot;
+# the live slot would inherit whatever (or no) CMD was on its own
+# definition and a single-image-multiple-binaries layout would silently
+# run the wrong binary.
+SERVICE_OVERRIDE_LINE=$(grep 'appDefinitions/update' "$CALL_LOG" \
+  | grep 'slack-mcp-server-live' \
+  | grep '"envVars"' \
+  | grep '"serviceUpdateOverride"' \
+  | head -n 1 || true)
+assert "serviceUpdateOverride carries from build to live" \
+  test -n "$SERVICE_OVERRIDE_LINE"
+if [ -n "$SERVICE_OVERRIDE_LINE" ]; then
+  SERVICE_OVERRIDE_PAYLOAD=$(printf '%s' "$SERVICE_OVERRIDE_LINE" | sed 's/.*data=//')
+  assert "carried-forward override pins token-bridge binary" \
+    bash -c "echo '$SERVICE_OVERRIDE_PAYLOAD' | jq -e '.serviceUpdateOverride | contains(\"/usr/local/bin/token-bridge\")' >/dev/null"
+fi
+
 # --- Order assertion: env-copy must run BEFORE deploy stub (so live boots
 # with correct env). The shim doesn't see deploy directly, but the env-copy
 # update must precede the SSL enable call.
 ENV_LINENUM=$(grep -n 'appDefinitions/update' "$CALL_LOG" \
-  | grep 'slack-mcp-server-dev' \
+  | grep 'slack-mcp-server-live' \
   | grep '"envVars"' \
   | head -n 1 | cut -d: -f1 || true)
 SSL_LINENUM=$(grep -n 'appDefinitions/enablebasedomainssl' "$CALL_LOG" \
@@ -302,7 +327,7 @@ assert "ssl-fail: enablebasedomainssl was attempted" \
 # CRITICAL: no forceSsl=true update was sent for the live slot, because SSL
 # enable failed. Otherwise the slot would be unreachable over HTTPS.
 FORCE_SSL_LINE_FAIL=$(grep 'appDefinitions/update' "$CALL_LOG_FAIL" \
-  | grep 'slack-mcp-server-dev' \
+  | grep 'slack-mcp-server-live' \
   | grep '"forceSsl":true' \
   | head -n 1 || true)
 assert "ssl-fail: forceSsl=true must NOT be sent when SSL enable failed" \

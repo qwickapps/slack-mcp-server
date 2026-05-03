@@ -1,0 +1,278 @@
+# Caller workflow: fans out the three slack-* services that share
+# Dockerfile.qwickapps into three independent deploy-app.yml runs.
+#
+# Each service is the same image with a different CMD (token-bridge,
+# multiplexer, setup) and a different container port. CapRover does
+# not expose CMD as a first-class app field; we set it via the new
+# `cmd` input on deploy-app.yml, which threads through to
+# configure-caprover-app.sh's --cmd flag (writes serviceUpdateOverride).
+#
+# Per qwickapps/mcp#84:
+#   - 3 env files written to /tmp/app-env-{slack-bridge,slack-multiplexer,slack-setup}.env
+#     ahead of the matrix fan-out, so each provision-app step picks up
+#     the correct subset (BRIDGE_HMAC_KEY shared by bridge+setup;
+#     TOKEN_ENCRYPTION_KEY shared by bridge+multiplexer; etc.)
+#   - matrix-on-uses runs the three deploy-app.yml calls in parallel.
+#
+# qwickapps/slack-mcp-server`s legacy single-binary caller (deploy.yml)
+# remains for the upstream `slack-mcp-server` app and is unaffected.
+#
+# Note on duplicate builds: each matrix variant rebuilds the same
+# Dockerfile.qwickapps and pushes a per-app image tag (img-slack-bridge-dev,
+# img-slack-multiplexer-dev, img-slack-setup-dev). A single shared build
+# job would save runner time but is out of scope for this PR (#84
+# observation note); the fan-out shape is what unblocks #81.
+
+name: Deploy slack-mcp-server (3 apps)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [dev, uat, prod]
+        default: dev
+
+concurrency:
+  group: slack-mcp-server-three-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Resolve environment ─────────────────────────────────────────────────────
+  resolve-env:
+    runs-on: [self-hosted, macmini]
+    outputs:
+      environment:   ${{ steps.env.outputs.environment }}
+      caprover_host: ${{ steps.env.outputs.caprover_host }}
+    steps:
+      - name: Determine environment
+        id: env
+        run: |
+          ENV="${{ inputs.environment }}"
+          case "$ENV" in
+            prod)
+              CAPROVER_HOST="captain.app.qwickforge.com"
+              ;;
+            uat)
+              CAPROVER_HOST="captain.app.qwickforge.com"
+              ;;
+            *)
+              CAPROVER_HOST="captain.dev.qwickforge.com"
+              ;;
+          esac
+
+          echo "environment=${ENV}"               >> "$GITHUB_OUTPUT"
+          echo "caprover_host=${CAPROVER_HOST}"   >> "$GITHUB_OUTPUT"
+
+      - name: Guard against feature-branch deploys
+        run: |
+          # Mirrors deploy.yml's guard. Manual dispatch is the only entry
+          # point today, but if a future cron or push trigger is added this
+          # check stops it from picking up arbitrary refs.
+          REF="${{ github.ref }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Dispatch source: workflow_dispatch — OK"
+          elif echo "$REF" | grep -q '^refs/tags/'; then
+            echo "Dispatch source: tag push — OK"
+          elif [ "$REF" = "refs/heads/main" ] || [ "$REF" = "refs/heads/master" ]; then
+            echo "Dispatch source: protected branch push — OK"
+          else
+            echo "ERROR: Workflow triggered from feature branch: $REF"
+            echo "Use workflow_dispatch from master/main instead."
+            exit 1
+          fi
+
+  # ── Write per-app env files ────────────────────────────────────────────────
+  # One env file per app, written to /tmp on the runner. deploy-app.yml's
+  # provision-app step reads /tmp/app-env-${app_name}.env, so the file name
+  # must match the app_name passed in the matrix.
+  #
+  # Secret distribution per qwickapps/mcp#81:
+  #   - BRIDGE_HMAC_KEY        → slack-bridge + slack-setup (must match)
+  #   - TOKEN_ENCRYPTION_KEY   → slack-bridge + slack-multiplexer (must match)
+  #   - MULTIPLEXER_SERVICE_KEY → slack-multiplexer
+  #   - SETUP_SERVICE_KEY      → slack-setup
+  #   - DATABASE_URL           → all three (slack_mcp_server_${env} role)
+  #   - BRIDGE_URL             → slack-setup (templated into userscript)
+  write-env-files:
+    needs: resolve-env
+    runs-on: [self-hosted, macmini]
+    steps:
+      - name: Write env files from GHA secrets
+        env:
+          ENV: ${{ needs.resolve-env.outputs.environment }}
+          # Per-env shared secrets. Empty string when the secret is unset
+          # so a missing secret produces an empty value rather than the
+          # literal "${{ secrets.X }}" string in the env file.
+          BRIDGE_HMAC_KEY_DEV:           ${{ secrets.SLACK_MCP_SERVER_DEV_BRIDGE_HMAC_KEY }}
+          BRIDGE_HMAC_KEY_UAT:           ${{ secrets.SLACK_MCP_SERVER_UAT_BRIDGE_HMAC_KEY }}
+          BRIDGE_HMAC_KEY_PROD:          ${{ secrets.SLACK_MCP_SERVER_PROD_BRIDGE_HMAC_KEY }}
+          TOKEN_ENCRYPTION_KEY_DEV:      ${{ secrets.SLACK_MCP_SERVER_DEV_TOKEN_ENCRYPTION_KEY }}
+          TOKEN_ENCRYPTION_KEY_UAT:      ${{ secrets.SLACK_MCP_SERVER_UAT_TOKEN_ENCRYPTION_KEY }}
+          TOKEN_ENCRYPTION_KEY_PROD:     ${{ secrets.SLACK_MCP_SERVER_PROD_TOKEN_ENCRYPTION_KEY }}
+          MULTIPLEXER_SERVICE_KEY_DEV:   ${{ secrets.SLACK_MCP_SERVER_DEV_MULTIPLEXER_SERVICE_KEY }}
+          MULTIPLEXER_SERVICE_KEY_UAT:   ${{ secrets.SLACK_MCP_SERVER_UAT_MULTIPLEXER_SERVICE_KEY }}
+          MULTIPLEXER_SERVICE_KEY_PROD:  ${{ secrets.SLACK_MCP_SERVER_PROD_MULTIPLEXER_SERVICE_KEY }}
+          SETUP_SERVICE_KEY_DEV:         ${{ secrets.SLACK_MCP_SERVER_DEV_SETUP_SERVICE_KEY }}
+          SETUP_SERVICE_KEY_UAT:         ${{ secrets.SLACK_MCP_SERVER_UAT_SETUP_SERVICE_KEY }}
+          SETUP_SERVICE_KEY_PROD:        ${{ secrets.SLACK_MCP_SERVER_PROD_SETUP_SERVICE_KEY }}
+          DATABASE_URL_DEV:              ${{ secrets.SLACK_MCP_SERVER_DEV_DATABASE_URL }}
+          DATABASE_URL_UAT:              ${{ secrets.SLACK_MCP_SERVER_UAT_DATABASE_URL }}
+          DATABASE_URL_PROD:             ${{ secrets.SLACK_MCP_SERVER_PROD_DATABASE_URL }}
+          BRIDGE_URL_DEV:                ${{ secrets.SLACK_MCP_SERVER_DEV_BRIDGE_URL }}
+          BRIDGE_URL_UAT:                ${{ secrets.SLACK_MCP_SERVER_UAT_BRIDGE_URL }}
+          BRIDGE_URL_PROD:               ${{ secrets.SLACK_MCP_SERVER_PROD_BRIDGE_URL }}
+          # Tailscale auth (multiplexer + setup are tailnet-only)
+          TS_AUTHKEY_DEV:                ${{ secrets.SLACK_MCP_SERVER_DEV_TS_AUTHKEY }}
+          TS_AUTHKEY_UAT:                ${{ secrets.SLACK_MCP_SERVER_UAT_TS_AUTHKEY }}
+          TS_AUTHKEY_PROD:               ${{ secrets.SLACK_MCP_SERVER_PROD_TS_AUTHKEY }}
+          TS_API_KEY_DEV:                ${{ secrets.SLACK_MCP_SERVER_DEV_TS_API_KEY }}
+          TS_API_KEY_UAT:                ${{ secrets.SLACK_MCP_SERVER_UAT_TS_API_KEY }}
+          TS_API_KEY_PROD:               ${{ secrets.SLACK_MCP_SERVER_PROD_TS_API_KEY }}
+        run: |
+          # Resolve per-env values once.
+          case "$ENV" in
+            prod)
+              BRIDGE_HMAC_KEY="$BRIDGE_HMAC_KEY_PROD"
+              TOKEN_ENCRYPTION_KEY="$TOKEN_ENCRYPTION_KEY_PROD"
+              MULTIPLEXER_SERVICE_KEY="$MULTIPLEXER_SERVICE_KEY_PROD"
+              SETUP_SERVICE_KEY="$SETUP_SERVICE_KEY_PROD"
+              DATABASE_URL="$DATABASE_URL_PROD"
+              BRIDGE_URL="$BRIDGE_URL_PROD"
+              TS_AUTHKEY="$TS_AUTHKEY_PROD"
+              TS_API_KEY="$TS_API_KEY_PROD"
+              ;;
+            uat)
+              BRIDGE_HMAC_KEY="$BRIDGE_HMAC_KEY_UAT"
+              TOKEN_ENCRYPTION_KEY="$TOKEN_ENCRYPTION_KEY_UAT"
+              MULTIPLEXER_SERVICE_KEY="$MULTIPLEXER_SERVICE_KEY_UAT"
+              SETUP_SERVICE_KEY="$SETUP_SERVICE_KEY_UAT"
+              DATABASE_URL="$DATABASE_URL_UAT"
+              BRIDGE_URL="$BRIDGE_URL_UAT"
+              TS_AUTHKEY="$TS_AUTHKEY_UAT"
+              TS_API_KEY="$TS_API_KEY_UAT"
+              ;;
+            *)
+              BRIDGE_HMAC_KEY="$BRIDGE_HMAC_KEY_DEV"
+              TOKEN_ENCRYPTION_KEY="$TOKEN_ENCRYPTION_KEY_DEV"
+              MULTIPLEXER_SERVICE_KEY="$MULTIPLEXER_SERVICE_KEY_DEV"
+              SETUP_SERVICE_KEY="$SETUP_SERVICE_KEY_DEV"
+              DATABASE_URL="$DATABASE_URL_DEV"
+              BRIDGE_URL="$BRIDGE_URL_DEV"
+              TS_AUTHKEY="$TS_AUTHKEY_DEV"
+              TS_API_KEY="$TS_API_KEY_DEV"
+              ;;
+          esac
+
+          # Mask everything before any line writes to disk so a stray echo
+          # cannot surface a secret in the action log.
+          for v in "$BRIDGE_HMAC_KEY" "$TOKEN_ENCRYPTION_KEY" \
+                   "$MULTIPLEXER_SERVICE_KEY" "$SETUP_SERVICE_KEY" \
+                   "$DATABASE_URL" "$BRIDGE_URL" \
+                   "$TS_AUTHKEY" "$TS_API_KEY"; do
+            [ -n "$v" ] && echo "::add-mask::$v"
+          done
+
+          # ── slack-bridge ────────────────────────────────────────────────
+          # Public-facing token-bridge endpoint. Needs HMAC + encryption keys
+          # plus DATABASE_URL. No tailnet wiring — this is the only one of
+          # the three that's reachable from the public internet.
+          printf '%s\n' \
+            "BRIDGE_HMAC_KEY=${BRIDGE_HMAC_KEY}" \
+            "TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}" \
+            "DATABASE_URL=${DATABASE_URL}" \
+            "BRIDGE_PORT=13081" \
+            "PORT=13081" \
+            "APP_NAME=slack-bridge" \
+            > /tmp/app-env-slack-bridge.env
+
+          # ── slack-multiplexer ───────────────────────────────────────────
+          # Tailnet-only. Needs encryption key + service key + DATABASE_URL.
+          # TS_* used by entrypoint to join the tailnet.
+          printf '%s\n' \
+            "TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}" \
+            "MULTIPLEXER_SERVICE_KEY=${MULTIPLEXER_SERVICE_KEY}" \
+            "DATABASE_URL=${DATABASE_URL}" \
+            "MULTIPLEXER_PORT=13082" \
+            "PORT=13082" \
+            "APP_NAME=slack-multiplexer" \
+            "TS_AUTHKEY=${TS_AUTHKEY}" \
+            "TS_HOSTNAME=slack-multiplexer-${ENV}" \
+            "TS_TAGS=tag:container" \
+            "TS_API_KEY=${TS_API_KEY}" \
+            > /tmp/app-env-slack-multiplexer.env
+
+          # ── slack-setup ─────────────────────────────────────────────────
+          # Tailnet-only admin install service. BRIDGE_URL is templated into
+          # the userscript at request time; setup must agree with bridge on
+          # BRIDGE_HMAC_KEY so signatures verify.
+          printf '%s\n' \
+            "BRIDGE_HMAC_KEY=${BRIDGE_HMAC_KEY}" \
+            "SETUP_SERVICE_KEY=${SETUP_SERVICE_KEY}" \
+            "DATABASE_URL=${DATABASE_URL}" \
+            "BRIDGE_URL=${BRIDGE_URL}" \
+            "SETUP_PORT=13083" \
+            "PORT=13083" \
+            "APP_NAME=slack-setup" \
+            "TS_AUTHKEY=${TS_AUTHKEY}" \
+            "TS_HOSTNAME=slack-setup-${ENV}" \
+            "TS_TAGS=tag:container" \
+            "TS_API_KEY=${TS_API_KEY}" \
+            > /tmp/app-env-slack-setup.env
+
+          for f in slack-bridge slack-multiplexer slack-setup; do
+            echo "Wrote /tmp/app-env-${f}.env ($(wc -l < /tmp/app-env-${f}.env) lines)"
+          done
+
+  # ── Deploy each app via deploy-app.yml ─────────────────────────────────────
+  # Matrix-on-uses fans out three independent calls. Each one runs the full
+  # blue-green pipeline (build → provision → deploy → health-check → swap).
+  # Per-app inputs:
+  #   container_port — must match the binary's listening port
+  #   public_url     — what the gateway / external caller hits
+  #   cmd            — absolute binary path inside Dockerfile.qwickapps
+  deploy:
+    needs: [resolve-env, write-env-files]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app_name: slack-bridge
+            container_port: '13081'
+            health_path: /_health
+            # slack-bridge is the ONLY public app of the three. The
+            # gateway routes slack-bridge.dev.qwickapps.com → CapRover.
+            public_url: https://slack-bridge.dev.qwickapps.com
+            cmd: /usr/local/bin/token-bridge
+          - app_name: slack-multiplexer
+            container_port: '13082'
+            health_path: /_health
+            # Tailscale-only — the URL is informational; the gateway
+            # is not used and external DNS does not resolve it.
+            public_url: https://slack-multiplexer.taile324e7.ts.net
+            cmd: /usr/local/bin/multiplexer
+          - app_name: slack-setup
+            container_port: '13083'
+            health_path: /_health
+            public_url: https://slack-setup.taile324e7.ts.net
+            cmd: /usr/local/bin/setup
+    uses: ./.github/workflows/deploy-app.yml
+    secrets: inherit
+    with:
+      app_name:           ${{ matrix.app_name }}
+      environment:        ${{ needs.resolve-env.outputs.environment }}
+      dockerfile_path:    Dockerfile.qwickapps
+      package_json_path:  package.json
+      workspace_packages: ''
+      container_port:     ${{ matrix.container_port }}
+      health_path:        ${{ matrix.health_path }}
+      caprover_host:      ${{ needs.resolve-env.outputs.caprover_host }}
+      public_url:         ${{ matrix.public_url }}
+      run_migrations:     'false'
+      run_e2e:            'false'
+      cmd:                ${{ matrix.cmd }}
+      critical_subsystems:       ''
+      warning_subsystems:        ''
+      prod_critical_subsystems:  ''
