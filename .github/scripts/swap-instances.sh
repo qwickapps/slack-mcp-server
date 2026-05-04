@@ -215,10 +215,10 @@ ensure_app_exists() {
   fi
 }
 
-# Issue #13: copy envVars from $1 (source app) into $2 (target app) via the
-# appDefinitions/update endpoint. Read-then-write: target's other fields are
-# preserved. No-op (with warning) when source has zero env vars and no CMD
-# override.
+# Issue #13: copy deploy metadata from $1 (source app) into $2 (target app) via
+# the appDefinitions/update endpoint. Read-then-write: target's unrelated fields
+# are preserved. No-op (with warning) when source has zero env vars, no CMD
+# override, and no configured container HTTP port.
 #
 # qwickapps/mcp#84: also carry over `serviceUpdateOverride` (the CMD override
 # slot used when one image ships multiple binaries) so that an override
@@ -227,6 +227,9 @@ ensure_app_exists() {
 # forward; the live app would inherit whatever (or no) CMD was on its
 # definition, and a multi-binary image layout would silently run the wrong
 # binary in the live slot.
+# qwickapps/mcp#81: also carry over `containerHttpPort`. The three P3 apps
+# listen on 13081/13082/13083; newly-created live/stable slots otherwise keep
+# CapRover's default port 80 and nginx returns 502 after manual promotion.
 copy_env_vars() {
   local src="$1"
   local dst="$2"
@@ -250,8 +253,11 @@ copy_env_vars() {
   local svc_override
   svc_override=$(echo "$src_def" | jq -r '.serviceUpdateOverride // ""')
 
-  if [ "$var_count" = "0" ] && [ -z "$svc_override" ]; then
-    echo "  Warning: source $src has 0 env vars and no CMD override, skipping copy (target $dst may fail to start)"
+  local container_port
+  container_port=$(echo "$src_def" | jq -r '.containerHttpPort // empty')
+
+  if [ "$var_count" = "0" ] && [ -z "$svc_override" ] && [ -z "$container_port" ]; then
+    echo "  Warning: source $src has 0 env vars, no CMD override, and no containerHttpPort; skipping copy (target $dst may fail to start)"
     return 0
   fi
 
@@ -271,6 +277,11 @@ copy_env_vars() {
     merged=$(echo "$merged" | jq --arg override "$svc_override" '.serviceUpdateOverride = $override')
   fi
 
+  if [ -n "$container_port" ]; then
+    echo "  Carrying containerHttpPort forward: $container_port"
+    merged=$(echo "$merged" | jq --argjson port "$container_port" '.containerHttpPort = $port')
+  fi
+
   if [ -n "$svc_override" ]; then
     echo "  Writing $var_count env vars to $dst (and CMD override)"
   else
@@ -288,9 +299,9 @@ copy_env_vars() {
   status=$(echo "$response" | jq -r '.status')
   if [ "$status" = "100" ] || [ "$status" = "1000" ]; then
     if [ -n "$svc_override" ]; then
-      echo "  Env vars copied: $src -> $dst ($var_count vars + CMD override)"
+      echo "  Env vars copied: $src -> $dst ($var_count vars + CMD override + containerHttpPort=${container_port:-unchanged})"
     else
-      echo "  Env vars copied: $src -> $dst ($var_count vars)"
+      echo "  Env vars copied: $src -> $dst ($var_count vars + containerHttpPort=${container_port:-unchanged})"
     fi
   else
     echo "  Warning: env copy response: $(echo "$response" | jq -r '.description // "unknown"')"

@@ -227,9 +227,13 @@ jobs:
 
           ENV_VARS=$(echo "$LIVE_DEF" | jq -c '.envVars // []')
           SVC_OVERRIDE=$(echo "$LIVE_DEF" | jq -r '.serviceUpdateOverride // ""')
+          CONTAINER_PORT=$(echo "$LIVE_DEF" | jq -r '.containerHttpPort // empty')
           MERGED=$(echo "$STABLE_DEF" | jq --argjson vars "$ENV_VARS" '.envVars = $vars')
           if [ -n "$SVC_OVERRIDE" ]; then
             MERGED=$(echo "$MERGED" | jq --arg override "$SVC_OVERRIDE" '.serviceUpdateOverride = $override')
+          fi
+          if [ -n "$CONTAINER_PORT" ]; then
+            MERGED=$(echo "$MERGED" | jq --argjson port "$CONTAINER_PORT" '.containerHttpPort = $port')
           fi
 
           RESPONSE=$(curl -sf -X POST "${CAPROVER_URL}/api/v2/user/apps/appDefinitions/update" \
@@ -243,7 +247,7 @@ jobs:
             echo "ERROR: failed to copy live config to stable: $(echo "$RESPONSE" | jq -r '.description // "unknown"')"
             exit 1
           fi
-          echo "Copied live env vars and CMD override to ${STABLE_APP}."
+          echo "Copied live env vars, CMD override, and containerHttpPort=${CONTAINER_PORT:-unchanged} to ${STABLE_APP}."
 
       - name: Checkout code
         uses: actions/checkout@v4

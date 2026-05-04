@@ -1,7 +1,8 @@
 name: Deploy App (Reusable)
 
-# Reusable workflow: full blue-green traffic-light deployment pipeline for a qwickapps product.
-# Handles: build → provision-app → provision-gateway → deploy-and-verify → traffic-light-swap → cleanup.
+# Reusable workflow: build-slot deployment and verification for a qwickapps product.
+# Handles: build → provision-app → provision-gateway → deploy-and-verify → cleanup.
+# Promotion to live is intentionally manual via promote-to-live.yml.
 #
 # Callers pass app-specific inputs; all secrets are inherited via `secrets: inherit`.
 # Vendored from qwickapps/slack pipeline. Caller: deploy.yml.
@@ -613,136 +614,11 @@ jobs:
           echo "  [FAIL] Smoke test failed — $SMOKE_URL returned HTTP $STATUS after $MAX attempts"
           exit 1
 
-  # ── Phase 3: Traffic-light swap (build → live, live → stable) ────────────────
-  traffic-light-deploy:
-    needs: [prepare, build, provision-app, provision-gateway, deploy-and-verify]
-    if: |
-      always() &&
-      needs.prepare.result == 'success' &&
-      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
-      needs.provision-app.result == 'success' &&
-      needs.deploy-and-verify.result == 'success'
-    runs-on: [self-hosted, macmini]
-    concurrency:
-      group: caprover-traffic-light-${{ inputs.app_name }}-${{ inputs.environment }}
-      cancel-in-progress: false
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Resolve CapRover credentials
-        run: |
-          ENV="${{ inputs.environment }}"
-          if [ "$ENV" = "dev" ]; then
-            CP_URL="${{ secrets.OCI_DEV_CAPROVER_URL }}"
-            CP_PASS="${{ secrets.OCI_DEV_CAPROVER_PASSWORD }}"
-          else
-            CP_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
-            CP_PASS="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
-          fi
-
-          if [ -z "$CP_URL" ] || [ "$CP_URL" = "null" ]; then
-            CP_URL="https://${{ inputs.caprover_host }}"
-          fi
-
-          GW_URL="${{ secrets.OCI_GATEWAY_CAPROVER_URL }}"
-          GW_PASS="${{ secrets.OCI_GATEWAY_CAPROVER_PASSWORD }}"
-
-          echo "::add-mask::$CP_PASS"
-          echo "::add-mask::$GW_PASS"
-          echo "CAPROVER_URL=$CP_URL"             >> "$GITHUB_ENV"
-          echo "CAPROVER_PASSWORD=$CP_PASS"       >> "$GITHUB_ENV"
-          echo "ROUTE_CAPROVER_URL=$GW_URL"       >> "$GITHUB_ENV"
-          echo "ROUTE_CAPROVER_PASSWORD=$GW_PASS" >> "$GITHUB_ENV"
-          echo "GHCR_PULL_TOKEN=${{ secrets.GHCR_PULL_TOKEN }}" >> "$GITHUB_ENV"
-
-      - name: Make scripts executable
-        run: chmod +x .github/scripts/*.sh
-
-      # Issue #11: deploy-traffic-light.sh runs `pnpm playwright test` from the
-      # repo root when run_e2e=true. Standalone repos (e.g. qwickapps/slack)
-      # check out fresh in this job and have no node_modules, so pnpm cannot
-      # find the playwright binary. Install deps before running E2E. Mirrors
-      # the setup pattern used by the build job above.
-      - name: Setup Node.js
-        if: inputs.run_e2e == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Setup pnpm
-        if: inputs.run_e2e == 'true'
-        run: |
-          corepack enable
-          corepack install
-          pnpm --version
-
-      - name: Install dependencies for E2E
-        if: inputs.run_e2e == 'true'
-        run: pnpm install --no-frozen-lockfile --store-dir .pnpm-store
-
-      - name: Run traffic-light deployment
-        run: |
-          # Compute effective subsystem classification (same env-aware logic as deep health check step)
-          ENV="${{ inputs.environment }}"
-          EFFECTIVE_CRITICAL="${{ inputs.critical_subsystems }}"
-          EFFECTIVE_WARNING="${{ inputs.warning_subsystems }}"
-          PROD_CRITICAL="${{ inputs.prod_critical_subsystems }}"
-
-          if [ -n "$PROD_CRITICAL" ] && [ "$ENV" != "dev" ]; then
-            if [ -n "$EFFECTIVE_CRITICAL" ]; then
-              EFFECTIVE_CRITICAL="${EFFECTIVE_CRITICAL},${PROD_CRITICAL}"
-            else
-              EFFECTIVE_CRITICAL="${PROD_CRITICAL}"
-            fi
-            EFFECTIVE_WARNING=$(echo "$EFFECTIVE_WARNING" | tr ',' '\n' |               while IFS= read -r item; do
-                trimmed=$(echo "$item" | xargs)
-                if echo "$PROD_CRITICAL" | tr ',' '\n' | xargs -I{} sh -c 'test "$1" = "$2"' _ {} "$trimmed" 2>/dev/null; then
-                  :
-                else
-                  [ -n "$trimmed" ] && echo "$trimmed"
-                fi
-              done | paste -sd ',')
-          elif [ -n "$PROD_CRITICAL" ] && [ "$ENV" = "dev" ]; then
-            if [ -n "$EFFECTIVE_WARNING" ]; then
-              EFFECTIVE_WARNING="${EFFECTIVE_WARNING},${PROD_CRITICAL}"
-            else
-              EFFECTIVE_WARNING="${PROD_CRITICAL}"
-            fi
-          fi
-
-          .github/scripts/deploy-traffic-light.sh \
-            --product           "${{ inputs.app_name }}" \
-            --environment       "${{ inputs.environment }}" \
-            --image-ref         "${{ needs.prepare.outputs.image_ref }}" \
-            --caprover-url        "$CAPROVER_URL" \
-            --caprover-password   "$CAPROVER_PASSWORD" \
-            --route-caprover-url  "$ROUTE_CAPROVER_URL" \
-            --route-caprover-password "$ROUTE_CAPROVER_PASSWORD" \
-            --github-token        "$GHCR_PULL_TOKEN" \
-            --github-owner        "${{ env.OWNER }}" \
-            --health-path         "${{ inputs.health_path }}" \
-            --run-migrations      "${{ inputs.run_migrations }}" \
-            --run-e2e             "${{ inputs.run_e2e }}" \
-            --critical-subsystems "$EFFECTIVE_CRITICAL" \
-            --warning-subsystems  "$EFFECTIVE_WARNING"
-
-      - name: Point gateway at live slot
-        run: |
-          .github/scripts/setup-qwickway-route.sh \
-            --gateway-app-name "${{ needs.prepare.outputs.gateway_app_name }}" \
-            --target-app-url   "${{ needs.prepare.outputs.live_app_url }}" \
-            --route-caprover-url      "$ROUTE_CAPROVER_URL" \
-            --route-caprover-password "$ROUTE_CAPROVER_PASSWORD" \
-            --health-check-path "${{ inputs.health_path }}" \
-            --github-token      "$GHCR_PULL_TOKEN" \
-            --github-owner      "${{ env.OWNER }}"
-
-  # ── Phase 4: Clean up old dev builds ─────────────────────────────────────────
+  # ── Phase 3: Clean up old dev builds ─────────────────────────────────────────
   cleanup-dev:
-    needs: [prepare, traffic-light-deploy]
+    needs: [prepare, deploy-and-verify]
     runs-on: [self-hosted, macmini]
-    if: always() && inputs.environment == 'dev' && needs.prepare.result == 'success'
+    if: always() && inputs.environment == 'dev' && needs.prepare.result == 'success' && needs.deploy-and-verify.result == 'success'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

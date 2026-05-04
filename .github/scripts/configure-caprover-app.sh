@@ -37,7 +37,7 @@ APP_NAME=""
 CAPROVER_URL=""
 CAPROVER_PASSWORD=""
 INSTANCE_COUNT=1
-CONTAINER_PORT=3300
+CONTAINER_PORT=""
 FORCE_SSL="true"
 ENABLE_SSL="true"
 WEBSOCKET_SUPPORT="true"
@@ -128,8 +128,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate required arguments
-if [ -z "$APP_NAME" ] || [ -z "$CAPROVER_URL" ] || [ -z "$CAPROVER_PASSWORD" ]; then
+if [ -z "$APP_NAME" ] || [ -z "$CAPROVER_URL" ] || [ -z "$CAPROVER_PASSWORD" ] || [ -z "$CONTAINER_PORT" ]; then
   echo "Error: Missing required arguments"
+  echo "Required: --app-name, --caprover-url, --caprover-password, --container-port"
+  exit 1
+fi
+
+if ! [[ "$CONTAINER_PORT" =~ ^[0-9]+$ ]] || [ "$CONTAINER_PORT" -lt 1 ] || [ "$CONTAINER_PORT" -gt 65535 ]; then
+  echo "Error: --container-port must be an integer from 1 to 65535"
   exit 1
 fi
 

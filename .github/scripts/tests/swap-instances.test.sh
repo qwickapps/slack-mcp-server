@@ -39,6 +39,7 @@ BUILD_DEFINITION_JSON=$(cat <<'JSON'
   "hasDefaultSubDomainSsl": true,
   "forceSsl": true,
   "websocketSupport": true,
+  "containerHttpPort": 13081,
   "serviceUpdateOverride": "TaskTemplate:\n  ContainerSpec:\n    Command:\n      - /usr/local/bin/token-bridge\n"
 }
 JSON
@@ -51,6 +52,7 @@ LIVE_DEFINITION_JSON=$(cat <<'JSON'
   "hasDefaultSubDomainSsl": false,
   "forceSsl": false,
   "websocketSupport": false,
+  "containerHttpPort": 80,
   "serviceUpdateOverride": ""
 }
 JSON
@@ -231,6 +233,8 @@ if [ -n "$SERVICE_OVERRIDE_LINE" ]; then
   SERVICE_OVERRIDE_PAYLOAD=$(printf '%s' "$SERVICE_OVERRIDE_LINE" | sed 's/.*data=//')
   assert "carried-forward override pins token-bridge binary" \
     bash -c "echo '$SERVICE_OVERRIDE_PAYLOAD' | jq -e '.serviceUpdateOverride | contains(\"/usr/local/bin/token-bridge\")' >/dev/null"
+  assert "containerHttpPort carries from build to live" \
+    bash -c "echo '$SERVICE_OVERRIDE_PAYLOAD' | jq -e '.containerHttpPort == 13081' >/dev/null"
 fi
 
 # --- Order assertion: env-copy must run BEFORE deploy stub (so live boots
