@@ -20,10 +20,10 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Target environment'
+        description: 'Target environment. Corrected SOP allows dev builds only; use promote workflows for UAT/live.'
         required: true
         type: choice
-        options: [dev, uat, prod]
+        options: [dev]
         default: dev
 
 concurrency:
@@ -256,8 +256,8 @@ jobs:
       health_path:       /sse
       caprover_host:     ${{ needs.resolve-env.outputs.caprover_host }}
       public_url:        ${{ needs.resolve-env.outputs.public_url }}
-      run_migrations:    "false"
-      run_e2e:           "false"
+      run_migrations:    ${{ 'false' }}
+      run_e2e:           ${{ 'false' }}
       critical_subsystems: ""
       warning_subsystems:  ""
       prod_critical_subsystems: ""

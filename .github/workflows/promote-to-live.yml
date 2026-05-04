@@ -1,6 +1,6 @@
-# qwickapps/slack-mcp-server - manual promote-to-live for the blue-green pipeline.
+# qwickapps/slack-mcp-server - corrected DEV -> UAT cross-host digest promotion.
 
-name: Promote Slack App to Live
+name: Promote Slack App Dev Build to UAT
 
 on:
   workflow_dispatch:
@@ -11,20 +11,18 @@ on:
         type: choice
         options: [slack-mcp-server, slack-bridge, slack-multiplexer, slack-setup]
         default: slack-mcp-server
-      image_ref:
-        description: |
-          Full GHCR image reference to deploy as live.
-          Examples:
-            ghcr.io/qwickapps/img-slack-mcp-server-dev@sha256:<digest>
-            ghcr.io/qwickapps/img-slack-bridge-prod:1.0.0.42
-        required: true
-        type: string
-      environment:
-        description: 'Target environment for live slot'
+      source_env:
+        description: 'Source environment. Corrected SOP supports dev build slots only.'
         required: true
         type: choice
-        options: [dev, uat, prod]
-        default: prod
+        options: [dev]
+        default: dev
+      target_env:
+        description: 'Target environment on oci-main.'
+        required: true
+        type: choice
+        options: [uat]
+        default: uat
       health_path:
         description: 'Override health path. Defaults to /sse for slack-mcp-server and /_health for the three P3 apps.'
         required: false
@@ -32,53 +30,58 @@ on:
         default: ''
 
 concurrency:
-  group: slack-promote-live-${{ inputs.app_name }}-${{ inputs.environment }}
+  group: slack-promote-dev-to-uat-${{ inputs.app_name }}
   cancel-in-progress: false
 
 env:
   OWNER: qwickapps
 
 jobs:
-  promote-to-live:
+  promote-dev-to-uat:
     runs-on: [self-hosted, macmini]
     steps:
-      - name: Validate inputs
+      - name: Validate inputs and resolve app metadata
+        id: meta
         run: |
-          IMAGE_REF="${{ inputs.image_ref }}"
           APP="${{ inputs.app_name }}"
-          ENV="${{ inputs.environment }}"
-
-          if [ -z "$IMAGE_REF" ]; then
-            echo "ERROR: image_ref input is required."
-            exit 1
-          fi
+          SOURCE_ENV="${{ inputs.source_env }}"
+          TARGET_ENV="${{ inputs.target_env }}"
 
           case "$APP" in
-            slack-mcp-server|slack-bridge|slack-multiplexer|slack-setup) ;;
+            slack-mcp-server)
+              CONTAINER_PORT="13080"
+              CMD=""
+              DEFAULT_HEALTH_PATH="/sse"
+              ;;
+            slack-bridge)
+              CONTAINER_PORT="13081"
+              CMD="/usr/local/bin/token-bridge"
+              DEFAULT_HEALTH_PATH="/_health"
+              ;;
+            slack-multiplexer)
+              CONTAINER_PORT="13082"
+              CMD="/usr/local/bin/multiplexer"
+              DEFAULT_HEALTH_PATH="/_health"
+              ;;
+            slack-setup)
+              CONTAINER_PORT="13083"
+              CMD="/usr/local/bin/setup"
+              DEFAULT_HEALTH_PATH="/_health"
+              ;;
             *)
               echo "ERROR: unsupported app_name: $APP"
               exit 1
               ;;
           esac
 
-          # The three-app deploy builds one shared image named
-          # img-slack-mcp-server-${ENV}; legacy callers may still provide a
-          # per-app image. Accept both shapes for qwickapps/mcp#84.
-          if ! echo "$IMAGE_REF" | grep -Eq "^ghcr.io/qwickapps/img-(${APP}|slack-mcp-server)-${ENV}([:@])"; then
-            echo "ERROR: image_ref does not match app/environment."
-            echo "  Got: $IMAGE_REF"
-            echo "  Expected: ghcr.io/qwickapps/img-${APP}-${ENV}:<tag>"
-            echo "        or: ghcr.io/qwickapps/img-slack-mcp-server-${ENV}@sha256:<digest>"
+          if [ "$SOURCE_ENV" != "dev" ] || [ "$TARGET_ENV" != "uat" ]; then
+            echo "ERROR: corrected SOP only allows dev -> uat in this workflow."
             exit 1
           fi
 
           HEALTH_PATH="${{ inputs.health_path }}"
           if [ -z "$HEALTH_PATH" ]; then
-            if [ "$APP" = "slack-mcp-server" ]; then
-              HEALTH_PATH="/sse"
-            else
-              HEALTH_PATH="/_health"
-            fi
+            HEALTH_PATH="$DEFAULT_HEALTH_PATH"
           fi
           case "$HEALTH_PATH" in
             /*) ;;
@@ -88,125 +91,121 @@ jobs:
               ;;
           esac
 
-          echo "image_ref=${IMAGE_REF}"       >> "$GITHUB_ENV"
-          echo "APP_NAME=${APP}"              >> "$GITHUB_ENV"
-          echo "HEALTH_PATH=${HEALTH_PATH}"   >> "$GITHUB_ENV"
-
-      - name: Resolve CapRover credentials and slot names
-        run: |
-          ENV="${{ inputs.environment }}"
-          APP="${{ inputs.app_name }}"
-
-          case "$ENV" in
-            dev)
-              LIVE_APP="${APP}-live"
-              CAPROVER_URL="${{ secrets.OCI_DEV_CAPROVER_URL }}"
-              CAPROVER_PASSWORD="${{ secrets.OCI_DEV_CAPROVER_PASSWORD }}"
-              LIVE_APP_URL="https://${LIVE_APP}.dev.qwickforge.com"
-              ;;
-            prod)
-              LIVE_APP="${APP}-live"
-              CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
-              CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
-              LIVE_APP_URL="https://${LIVE_APP}.app.qwickforge.com"
-              ;;
-            uat)
-              LIVE_APP="${APP}-uat"
-              CAPROVER_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
-              CAPROVER_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
-              LIVE_APP_URL="https://${LIVE_APP}.app.qwickforge.com"
-              ;;
-          esac
-
-          if [ -z "$CAPROVER_URL" ] || [ -z "$CAPROVER_PASSWORD" ]; then
-            echo "ERROR: CapRover credentials not found for ${ENV}."
-            exit 1
-          fi
-
-          echo "::add-mask::$CAPROVER_PASSWORD"
-          echo "::add-mask::${{ secrets.GHCR_PULL_TOKEN }}"
-
-          echo "LIVE_APP=${LIVE_APP}"                   >> "$GITHUB_ENV"
-          echo "CAPROVER_URL=${CAPROVER_URL}"           >> "$GITHUB_ENV"
-          echo "CAPROVER_PASSWORD=${CAPROVER_PASSWORD}" >> "$GITHUB_ENV"
-          echo "LIVE_APP_URL=${LIVE_APP_URL}"           >> "$GITHUB_ENV"
-          echo "GHCR_PULL_TOKEN=${{ secrets.GHCR_PULL_TOKEN }}" >> "$GITHUB_ENV"
+          echo "source_app=${APP}-build" >> "$GITHUB_OUTPUT"
+          echo "target_app=${APP}-uat" >> "$GITHUB_OUTPUT"
+          echo "target_app_url=https://${APP}-uat.app.qwickforge.com" >> "$GITHUB_OUTPUT"
+          echo "container_port=${CONTAINER_PORT}" >> "$GITHUB_OUTPUT"
+          echo "cmd=${CMD}" >> "$GITHUB_OUTPUT"
+          echo "health_path=${HEALTH_PATH}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Promote build slot to live
+      - name: Resolve CapRover credentials
         run: |
-          chmod +x .github/scripts/*.sh
-          .github/scripts/swap-instances.sh \
-            --product "$APP_NAME" \
-            --environment "${{ inputs.environment }}" \
-            --direction promote \
-            --caprover-url "$CAPROVER_URL" \
-            --caprover-password "$CAPROVER_PASSWORD" \
-            --github-token "$GHCR_PULL_TOKEN" \
-            --github-owner "${{ env.OWNER }}" \
-            --build-image-ref "$image_ref"
+          SOURCE_URL="${{ secrets.OCI_DEV_CAPROVER_URL }}"
+          SOURCE_PASSWORD="${{ secrets.OCI_DEV_CAPROVER_PASSWORD }}"
+          TARGET_URL="${{ secrets.OCI_MAIN_CAPROVER_URL }}"
+          TARGET_PASSWORD="${{ secrets.OCI_MAIN_CAPROVER_PASSWORD }}"
+          GHCR_PULL_TOKEN="${{ secrets.GHCR_PULL_TOKEN }}"
 
-      - name: Validate live slot health
-        run: |
-          HEALTH_URL="${LIVE_APP_URL}${HEALTH_PATH}"
-          echo "Waiting for ${HEALTH_URL} to become healthy..."
-          MAX_ATTEMPTS=15
-          SLEEP_SEC=20
-          for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1
-            rc=$?
-            echo "  Attempt ${attempt}/${MAX_ATTEMPTS}: curl exit ${rc}"
-            if [ "$APP_NAME" = "slack-mcp-server" ]; then
-              if [ $rc -eq 0 ] || [ $rc -eq 28 ]; then
-                echo "Health check passed (exit ${rc})."
-                exit 0
-              fi
-            elif [ $rc -eq 0 ]; then
-              echo "Health check passed."
-              exit 0
-            fi
-            [ "$attempt" -lt "$MAX_ATTEMPTS" ] && sleep "$SLEEP_SEC"
-          done
-          echo "ERROR: Health check failed after ${MAX_ATTEMPTS} attempts."
-          exit 1
-
-      - name: Notify via Telegram
-        if: always()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          STATUS="${{ job.status }}"
-          ENV="${{ inputs.environment }}"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          if [ "$STATUS" = "success" ]; then
-            EMOJI="[OK]"
-            printf -v MSG '%s\n\n%s\n%s\n%s\n%s\n\n%s\n  app_name: %s\n  image_ref: %s' \
-              "${EMOJI} ${APP_NAME} promoted to LIVE (${ENV})" \
-              "Image: ${image_ref}" \
-              "Live URL: ${LIVE_APP_URL}" \
-              "Health: ${LIVE_APP_URL}${HEALTH_PATH}" \
-              "Run: ${RUN_URL}" \
-              "Next step - to promote to stable, run promote-to-stable.yml with:" \
-              "${APP_NAME}" \
-              "${image_ref}"
-          else
-            EMOJI="[FAIL]"
-            printf -v MSG '%s\n\n%s\n%s\n\n%s' \
-              "${EMOJI} ${APP_NAME} promote-to-live FAILED (${ENV})" \
-              "Image: ${image_ref}" \
-              "Run: ${RUN_URL}" \
-              "Check logs before re-attempting."
+          if [ -z "$SOURCE_URL" ] || [ -z "$SOURCE_PASSWORD" ] || [ -z "$TARGET_URL" ] || [ -z "$TARGET_PASSWORD" ]; then
+            echo "ERROR: missing CapRover credentials. Required: OCI_DEV_* and OCI_MAIN_*."
+            exit 1
+          fi
+          if [ -z "$GHCR_PULL_TOKEN" ]; then
+            echo "ERROR: GHCR_PULL_TOKEN is required."
+            exit 1
           fi
 
-          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" \
-              -d "{\"chat_id\":\"${TELEGRAM_CHAT_ID}\",\"text\":$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}" \
-              || echo "WARN: Telegram notification failed (non-fatal)"
-          else
-            echo "WARN: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set - skipping notification"
+          echo "::add-mask::$SOURCE_PASSWORD"
+          echo "::add-mask::$TARGET_PASSWORD"
+          echo "::add-mask::$GHCR_PULL_TOKEN"
+          echo "SOURCE_CAPROVER_URL=$SOURCE_URL" >> "$GITHUB_ENV"
+          echo "SOURCE_CAPROVER_PASSWORD=$SOURCE_PASSWORD" >> "$GITHUB_ENV"
+          echo "TARGET_CAPROVER_URL=$TARGET_URL" >> "$GITHUB_ENV"
+          echo "TARGET_CAPROVER_PASSWORD=$TARGET_PASSWORD" >> "$GITHUB_ENV"
+          echo "GHCR_PULL_TOKEN=$GHCR_PULL_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Read dev build-slot image digest
+        id: image
+        run: |
+          chmod +x .github/scripts/*.sh
+          IMAGE_REF="$(.github/scripts/caprover-slot-admin.sh image \
+            --app-name "${{ steps.meta.outputs.source_app }}" \
+            --caprover-url "$SOURCE_CAPROVER_URL" \
+            --caprover-password "$SOURCE_CAPROVER_PASSWORD")"
+
+          if ! printf '%s' "$IMAGE_REF" | grep -Eq '^ghcr.io/qwickapps/img-(slack-mcp-server|slack-bridge|slack-multiplexer|slack-setup)-dev@sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: source build slot is not deployed by immutable dev digest."
+            echo "Got: $IMAGE_REF"
+            exit 1
+          fi
+
+          echo "image_ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+          echo "Promoting immutable image: $IMAGE_REF"
+
+      - name: Write UAT env file
+        env:
+          SLACK_MCP_SERVER_UAT_XOXP_TOKEN:                 ${{ secrets.SLACK_MCP_SERVER_UAT_XOXP_TOKEN }}
+          SLACK_MCP_SERVER_UAT_XOXC_TOKEN:                 ${{ secrets.SLACK_MCP_SERVER_UAT_XOXC_TOKEN }}
+          SLACK_MCP_SERVER_UAT_XOXD_TOKEN:                 ${{ secrets.SLACK_MCP_SERVER_UAT_XOXD_TOKEN }}
+          SLACK_MCP_SERVER_UAT_BRIDGE_HMAC_KEY:            ${{ secrets.SLACK_MCP_SERVER_UAT_BRIDGE_HMAC_KEY }}
+          SLACK_MCP_SERVER_UAT_TOKEN_ENCRYPTION_KEY:       ${{ secrets.SLACK_MCP_SERVER_UAT_TOKEN_ENCRYPTION_KEY }}
+          SLACK_MCP_SERVER_UAT_MULTIPLEXER_SERVICE_KEY:    ${{ secrets.SLACK_MCP_SERVER_UAT_MULTIPLEXER_SERVICE_KEY }}
+          SLACK_MCP_SERVER_UAT_SETUP_SERVICE_KEY:          ${{ secrets.SLACK_MCP_SERVER_UAT_SETUP_SERVICE_KEY }}
+          SLACK_MCP_SERVER_UAT_DATABASE_URL:               ${{ secrets.SLACK_MCP_SERVER_UAT_DATABASE_URL }}
+          SLACK_MCP_SERVER_UAT_BRIDGE_URL:                 ${{ secrets.SLACK_MCP_SERVER_UAT_BRIDGE_URL }}
+          SLACK_MCP_SERVER_UAT_TS_AUTHKEY:                 ${{ secrets.SLACK_MCP_SERVER_UAT_TS_AUTHKEY }}
+          SLACK_MCP_SERVER_UAT_TS_API_KEY:                 ${{ secrets.SLACK_MCP_SERVER_UAT_TS_API_KEY }}
+        run: |
+          ENV_FILE="/tmp/app-env-uat-${{ inputs.app_name }}.env"
+          .github/scripts/write-slack-app-env-file.sh \
+            --app-name "${{ inputs.app_name }}" \
+            --environment uat \
+            --output "$ENV_FILE"
+          echo "PROMOTE_ENV_FILE=$ENV_FILE" >> "$GITHUB_ENV"
+
+      - name: Configure UAT slot on oci-main
+        run: |
+          CMD_ARGS=()
+          if [ -n "${{ steps.meta.outputs.cmd }}" ]; then
+            CMD_ARGS=(--cmd "${{ steps.meta.outputs.cmd }}")
+          fi
+
+          .github/scripts/configure-caprover-app.sh \
+            --app-name "${{ steps.meta.outputs.target_app }}" \
+            --caprover-url "$TARGET_CAPROVER_URL" \
+            --caprover-password "$TARGET_CAPROVER_PASSWORD" \
+            --container-port "${{ steps.meta.outputs.container_port }}" \
+            --env-file "$PROMOTE_ENV_FILE" \
+            "${CMD_ARGS[@]}"
+
+      - name: Deploy dev digest to UAT slot
+        run: |
+          .github/scripts/deploy-from-ghcr.sh \
+            --app-name "${{ steps.meta.outputs.target_app }}" \
+            --image-ref "${{ steps.image.outputs.image_ref }}" \
+            --caprover-url "$TARGET_CAPROVER_URL" \
+            --caprover-password "$TARGET_CAPROVER_PASSWORD" \
+            --github-token "$GHCR_PULL_TOKEN" \
+            --github-owner "${{ env.OWNER }}"
+
+      - name: Validate UAT slot health
+        run: |
+          .github/scripts/validate-deployment-health.sh \
+            --app-name "${{ steps.meta.outputs.target_app }}" \
+            --caprover-url "$TARGET_CAPROVER_URL" \
+            --caprover-password "$TARGET_CAPROVER_PASSWORD" \
+            --app-url "${{ steps.meta.outputs.target_app_url }}" \
+            --health-path "${{ steps.meta.outputs.health_path }}" \
+            --max-attempts 15 \
+            --sleep 20
+
+      - name: Remove UAT env file
+        if: always()
+        run: |
+          if [ -n "${PROMOTE_ENV_FILE:-}" ]; then
+            rm -f "$PROMOTE_ENV_FILE"
+            echo "Removed $PROMOTE_ENV_FILE"
           fi

@@ -26,6 +26,12 @@
 # deploy-app.yml matrix branches. deploy-app.yml skips its own build job when
 # image_ref is supplied, so the three CapRover apps consume the exact same
 # immutable image.
+#
+# Corrected blue-green SOP, 2026-05-04:
+# this workflow is the DEV build entrypoint only. It builds once, deploys the
+# three *-build slots to oci-dev/captain.dev.qwickforge.com, validates health,
+# and lets deploy-app.yml scale successful build slots to zero. UAT/live/stable
+# placement on oci-main is handled by the promote workflows by image digest.
 
 name: Deploy slack-mcp-server (3 apps)
 
@@ -33,10 +39,10 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Target environment'
+        description: 'Target environment. Corrected SOP allows dev builds only; use promote workflows for UAT/live.'
         required: true
         type: choice
-        options: [dev, uat, prod]
+        options: [dev]
         default: dev
 
 concurrency:
@@ -56,14 +62,13 @@ jobs:
         run: |
           ENV="${{ inputs.environment }}"
           case "$ENV" in
-            prod)
-              CAPROVER_HOST="captain.app.qwickforge.com"
-              ;;
-            uat)
-              CAPROVER_HOST="captain.app.qwickforge.com"
+            dev)
+              CAPROVER_HOST="captain.dev.qwickforge.com"
               ;;
             *)
-              CAPROVER_HOST="captain.dev.qwickforge.com"
+              echo "ERROR: deploy-three-apps.yml only performs dev builds."
+              echo "Use promote-to-live.yml for dev -> uat and promote-to-stable.yml for uat -> live/stable."
+              exit 1
               ;;
           esac
 

@@ -19,6 +19,16 @@ name: Deploy App (Reusable)
 
 on:
   workflow_call:
+    outputs:
+      image_ref:
+        description: 'Immutable image reference deployed to the build slot.'
+        value: ${{ jobs.prepare.outputs.image_ref }}
+      dev_needs_cleanup:
+        description: 'true when a dev build slot failed and was intentionally left running for debugging.'
+        value: ${{ jobs.dev-post-result.outputs.needs_cleanup }}
+      dev_scaled_down:
+        description: 'true when a successful dev build slot was scaled down to zero.'
+        value: ${{ jobs.dev-post-result.outputs.scaled_down }}
     inputs:
       # ── Identity ──────────────────────────────────────────────────────────────
       app_name:
@@ -154,25 +164,28 @@ jobs:
           fi
 
           case "$ENV" in
-            prod)
+            dev)
+              # Corrected blue-green SOP, 2026-05-04:
+              # dev builds are the only build slots on oci-dev. UAT/live/stable
+              # live on oci-main and are promoted by digest in the promote
+              # workflows, not rebuilt here.
               BUILD_APP="${APP}-build"
               LIVE_APP="${APP}-live"
               STABLE_APP="${APP}-stable"
               ;;
             uat)
-              BUILD_APP="${APP}-uat-build"
+              BUILD_APP="${APP}-uat"
               LIVE_APP="${APP}-uat"
-              STABLE_APP="${APP}-uat-stable"
+              STABLE_APP="${APP}-stable"
               ;;
-            *)
-              # qwickapps/mcp#84: dev now mirrors prod's full blue-green
-              # (build → live → stable). The historical single-slot path
-              # (issue qwickapps/slack#20) is retired. Slot apps live on
-              # the dev CapRover instance, so the prod-style names cannot
-              # collide with prod.
-              BUILD_APP="${APP}-build"
+            prod)
+              BUILD_APP="${APP}-live"
               LIVE_APP="${APP}-live"
               STABLE_APP="${APP}-stable"
+              ;;
+            *)
+              echo "ERROR: unsupported environment: $ENV"
+              exit 1
               ;;
           esac
 
@@ -214,10 +227,46 @@ jobs:
           echo "gateway_app_name=${GATEWAY_APP_NAME}" >> "$GITHUB_OUTPUT"
           echo "live_app_url=${LIVE_APP_URL}"         >> "$GITHUB_OUTPUT"
 
+  # ── Phase 0.5: Wipe dev build slot before reuse ─────────────────────────────
+  wipe-build-slot:
+    needs: prepare
+    if: inputs.environment == 'dev'
+    runs-on: [self-hosted, macmini]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve dev CapRover credentials
+        run: |
+          CP_URL="${{ secrets.OCI_DEV_CAPROVER_URL }}"
+          CP_PASS="${{ secrets.OCI_DEV_CAPROVER_PASSWORD }}"
+          if [ -z "$CP_URL" ] || [ "$CP_URL" = "null" ]; then
+            CP_URL="https://captain.dev.qwickforge.com"
+          fi
+          if [ -z "$CP_PASS" ]; then
+            echo "ERROR: OCI_DEV_CAPROVER_PASSWORD is required to wipe the dev build slot."
+            exit 1
+          fi
+          echo "::add-mask::$CP_PASS"
+          echo "CAPROVER_URL=$CP_URL"       >> "$GITHUB_ENV"
+          echo "CAPROVER_PASSWORD=$CP_PASS" >> "$GITHUB_ENV"
+
+      - name: Wipe dev build slot
+        run: |
+          chmod +x .github/scripts/*.sh
+          .github/scripts/caprover-slot-admin.sh wipe \
+            --app-name "${{ needs.prepare.outputs.build_app }}" \
+            --caprover-url "$CAPROVER_URL" \
+            --caprover-password "$CAPROVER_PASSWORD"
+
   # ── Phase 1: Build & push Docker image ───────────────────────────────────────
   build:
-    needs: prepare
-    if: inputs.image_ref == ''
+    needs: [prepare, wipe-build-slot]
+    if: |
+      always() &&
+      inputs.image_ref == '' &&
+      needs.prepare.result == 'success' &&
+      (needs.wipe-build-slot.result == 'success' || needs.wipe-build-slot.result == 'skipped')
     runs-on: [self-hosted, macmini]
     # GHCR push uses GHCR_PUSH_TOKEN PAT (see "Login to GHCR" step) — we don't
     # need elevated GITHUB_TOKEN packages:write, which the qwickapps org policy
@@ -302,10 +351,11 @@ jobs:
   # SOPS decrypt step in deploy-faabzi.yml. If no env file is present the job
   # skips env update and just ensures the app exists.
   provision-app:
-    needs: [prepare, build]
+    needs: [prepare, wipe-build-slot, build]
     if: |
       always() &&
       needs.prepare.result == 'success' &&
+      (needs.wipe-build-slot.result == 'success' || needs.wipe-build-slot.result == 'skipped') &&
       (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: [self-hosted, macmini]
     concurrency:
@@ -393,10 +443,11 @@ jobs:
 
   # ── Phase 1.5 (parallel with build): Provision gateway route ─────────────────
   provision-gateway:
-    needs: [prepare, build]
+    needs: [prepare, wipe-build-slot, build]
     if: |
       always() &&
       needs.prepare.result == 'success' &&
+      (needs.wipe-build-slot.result == 'success' || needs.wipe-build-slot.result == 'skipped') &&
       (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: [self-hosted, macmini]
     continue-on-error: true
@@ -614,36 +665,50 @@ jobs:
           echo "  [FAIL] Smoke test failed — $SMOKE_URL returned HTTP $STATUS after $MAX attempts"
           exit 1
 
-  # ── Phase 3: Clean up old dev builds ─────────────────────────────────────────
-  cleanup-dev:
-    needs: [prepare, deploy-and-verify]
+  # ── Phase 3: Scale successful dev build slots down ──────────────────────────
+  dev-post-result:
+    needs: [prepare, wipe-build-slot, build, provision-app, provision-gateway, deploy-and-verify]
     runs-on: [self-hosted, macmini]
-    if: always() && inputs.environment == 'dev' && needs.prepare.result == 'success' && needs.deploy-and-verify.result == 'success'
+    if: always() && inputs.environment == 'dev' && needs.prepare.result == 'success'
+    outputs:
+      needs_cleanup: ${{ steps.result.outputs.needs_cleanup }}
+      scaled_down:   ${{ steps.result.outputs.scaled_down }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Resolve credentials
+      - name: Resolve dev CapRover credentials
         run: |
           CP_PASS="${{ secrets.OCI_DEV_CAPROVER_PASSWORD }}"
-          GW_PASS="${{ secrets.OCI_GATEWAY_CAPROVER_PASSWORD }}"
           echo "::add-mask::$CP_PASS"
-          echo "::add-mask::$GW_PASS"
-          echo "OCI_DEV_CAPROVER_URL=${{ secrets.OCI_DEV_CAPROVER_URL }}"       >> "$GITHUB_ENV"
-          echo "OCI_DEV_CAPROVER_PASSWORD=$CP_PASS"                             >> "$GITHUB_ENV"
-          echo "ROUTE_CAPROVER_URL=${{ secrets.OCI_GATEWAY_CAPROVER_URL }}"     >> "$GITHUB_ENV"
-          echo "ROUTE_CAPROVER_PASSWORD=$GW_PASS"                               >> "$GITHUB_ENV"
+          echo "CAPROVER_URL=${{ secrets.OCI_DEV_CAPROVER_URL }}"       >> "$GITHUB_ENV"
+          echo "CAPROVER_PASSWORD=$CP_PASS"                             >> "$GITHUB_ENV"
 
       - name: Make scripts executable
         run: chmod +x .github/scripts/*.sh
 
-      - name: Clean up old dev builds
+      - name: Scale down successful dev build slot
+        if: needs.deploy-and-verify.result == 'success'
         run: |
-          .github/scripts/cleanup-dev-builds.sh \
-            --app-name-prefix   "${{ inputs.app_name }}" \
-            --caprover-url      "$OCI_DEV_CAPROVER_URL" \
-            --caprover-password "$OCI_DEV_CAPROVER_PASSWORD" \
-            --route-caprover-url      "$ROUTE_CAPROVER_URL" \
-            --route-caprover-password "$ROUTE_CAPROVER_PASSWORD" \
-            --gateway-app-name  "${{ inputs.app_name }}-dev" \
-            --dev-domain-suffix "dev.qwickforge.com"
+          .github/scripts/caprover-slot-admin.sh scale \
+            --app-name "${{ needs.prepare.outputs.build_app }}" \
+            --instance-count 0 \
+            --caprover-url "$CAPROVER_URL" \
+            --caprover-password "$CAPROVER_PASSWORD"
+
+      - name: Emit dev cleanup status
+        id: result
+        run: |
+          if [ "${{ needs.deploy-and-verify.result }}" = "success" ]; then
+            echo "needs_cleanup=false" >> "$GITHUB_OUTPUT"
+            echo "scaled_down=true" >> "$GITHUB_OUTPUT"
+            echo "Dev build slot ${{ needs.prepare.outputs.build_app }} passed health checks and was scaled to zero." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "needs_cleanup=true" >> "$GITHUB_OUTPUT"
+            echo "scaled_down=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "Dev build slot ${{ needs.prepare.outputs.build_app }} did not complete successfully."
+              echo ""
+              echo "The slot was left running for debugging and must be wiped before the next dev build."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
