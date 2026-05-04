@@ -2,7 +2,7 @@
 
 ## Pipeline Stages
 
-### Automatic (push to `master` branch or `workflow_dispatch`)
+### Build-slot deployment (push to `master` branch or `workflow_dispatch`)
 
 ```
 push to master
@@ -17,8 +17,12 @@ push to master
               ├── provision-app
               ├── provision-gateway
               ├── deploy-and-verify
-              └── traffic-light-deploy
+              └── cleanup-dev
 ```
+
+The deploy workflows stop after the build slot is deployed and verified.
+They do not promote build to live. Promotion requires an explicit
+`workflow_dispatch` run of `promote-to-live.yml`.
 
 ### Manual promotion
 

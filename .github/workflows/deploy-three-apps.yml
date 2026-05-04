@@ -316,9 +316,9 @@ jobs:
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
   # ── Deploy each app via deploy-app.yml ─────────────────────────────────────
-  # Matrix-on-uses fans out three independent calls. Each one runs the full
-  # blue-green pipeline (provision → deploy → health-check → swap) using the
-  # shared image digest built above.
+  # Matrix-on-uses fans out three independent calls. Each one provisions,
+  # deploys, and verifies only the build slot using the shared image digest
+  # built above. Live promotion is a separate manual workflow_dispatch.
   # Per-app inputs:
   #   container_port — must match the binary's listening port
   #   public_url     — what the gateway / external caller hits
@@ -361,8 +361,8 @@ jobs:
       health_path:        ${{ matrix.health_path }}
       caprover_host:      ${{ needs.resolve-env.outputs.caprover_host }}
       public_url:         ${{ matrix.public_url }}
-      run_migrations:     'false'
-      run_e2e:            'false'
+      run_migrations:     ${{ 'false' }}
+      run_e2e:            ${{ 'false' }}
       cmd:                ${{ matrix.cmd }}
       critical_subsystems:       ''
       warning_subsystems:        ''
