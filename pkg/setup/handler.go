@@ -72,6 +72,14 @@ func (h *Handler) auth(next http.Handler) http.Handler {
 // handleIndex returns an http.Handler that renders the workspace status page.
 func (h *Handler) handleIndex() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// `mux.Handle("/", ...)` is a catch-all — without this guard
+		// every unknown path would render the index. Reject explicitly
+		// so a typo doesn't accidentally hand a workspace listing
+		// to a request the operator didn't intend.
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -108,11 +116,7 @@ func (h *Handler) handleIndex() http.Handler {
 
 		// Derive the public-facing URL of this setup service so the rendered
 		// install instructions can show a copy-pastable curl command.
-		scheme := "http"
-		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
-			scheme = "https"
-		}
-		setupURL := scheme + "://" + r.Host
+		setupURL := deriveSetupURL(r)
 
 		data := struct {
 			Workspaces []row
@@ -145,10 +149,21 @@ func (h *Handler) handleUserscript() http.Handler {
 		// Derive the host portion from BRIDGE_URL for the @connect directive.
 		bridgeHost := bridgeHostFromURL(h.bridgeURL)
 
+		// __DOWNLOAD_URL__ records the source of the userscript in the
+		// Tampermonkey header so users (and the script's "Source URL"
+		// metadata in TM) know where to re-fetch a fresh copy. We
+		// deliberately do NOT template @updateURL: that endpoint
+		// requires the SETUP_SERVICE_KEY bearer header and Tampermonkey
+		// has no way to send it, so an @updateURL would just produce
+		// 401 noise on every TM update check. Manual re-download is
+		// the documented update path.
+		downloadURL := deriveSetupURL(r) + "/userscript.user.js"
+
 		script := strings.ReplaceAll(h.userscriptTemplate, "__BRIDGE_URL__", h.bridgeURL)
 		script = strings.ReplaceAll(script, "__BRIDGE_HMAC_KEY__", h.hmacKey)
 		// Replace the @connect placeholder too, which uses a separate token.
 		script = strings.ReplaceAll(script, "__BRIDGE_HOST__", bridgeHost)
+		script = strings.ReplaceAll(script, "__DOWNLOAD_URL__", downloadURL)
 
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="qwickapps-slack-bridge.user.js"`)
@@ -188,6 +203,16 @@ func (h *Handler) handleHealth() http.Handler {
 
 // bearerValid returns true when the request carries a valid
 // "Authorization: Bearer <key>" header, compared in constant time.
+//
+// Note on the length-mismatch short-circuit: ConstantTimeCompare
+// returns 0 immediately when the two slices differ in length. That
+// means the comparison time leaks the *length* of the supplied
+// token. That's safe here because key is SETUP_SERVICE_KEY — a
+// fixed deployment value — so an attacker who knows we're running
+// this binary already knows the expected length (the README's
+// `openssl rand -hex 32` produces a 64-character hex string from
+// 32 bytes of entropy; what gets length-compared is that 64-char
+// value). No new information is leaked.
 func bearerValid(r *http.Request, key string) bool {
 	auth := r.Header.Get("Authorization")
 	const prefix = "Bearer "
@@ -196,6 +221,18 @@ func bearerValid(r *http.Request, key string) bool {
 	}
 	provided := auth[len(prefix):]
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(key)) == 1
+}
+
+// deriveSetupURL returns the public-facing scheme://host of this setup
+// service, matching how a Tailnet caller (or a Tailscale-Serve TLS
+// terminator) reached us. Used to render copy-pastable curl examples
+// in the install page and to template the userscript's @downloadURL.
+func deriveSetupURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
 // bridgeHostFromURL extracts the host (with optional port) from a URL

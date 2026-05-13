@@ -284,3 +284,106 @@ func TestIndexListWorkspacesError(t *testing.T) {
 		t.Errorf("expected 500, got %d", rr.Code)
 	}
 }
+
+// TestIndexCatchAllRejectsUnknownPaths covers FU4 from the slack-mcp-server#9
+// review: `mux.Handle("/", ...)` is a catch-all, and without an explicit
+// path guard every unknown path would render the index. handleIndex must
+// 404 anything that isn't exactly "/".
+func TestIndexCatchAllRejectsUnknownPaths(t *testing.T) {
+	h := newTestHandler(t, &fakeReader{})
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	cases := []string{
+		"/typo",
+		"/admin",
+		"/anything",
+		"/foo/bar",
+	}
+	for _, path := range cases {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("Authorization", "Bearer "+testKey)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			if rr.Code != http.StatusNotFound {
+				t.Errorf("path %q: expected 404, got %d", path, rr.Code)
+			}
+		})
+	}
+
+	// Sanity: "/" itself still renders.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("/ expected 200, got %d", rr.Code)
+	}
+}
+
+// TestUserscriptDownloadURLSubstitution covers FU3 from the
+// slack-mcp-server#9 review: the templated userscript must include a
+// @downloadURL pointing back at the setup service so users (and
+// Tampermonkey) know where to refetch a fresh copy. The placeholder
+// must be substituted with the request's scheme + host.
+func TestUserscriptDownloadURLSubstitution(t *testing.T) {
+	// Add the new placeholder to the minimal stub so this file can
+	// exercise it independently. Template strings in tests are
+	// allowed to differ from the production userscript.
+	const stubWithDownloadURL = `// @connect __BRIDGE_HOST__
+// @downloadURL __DOWNLOAD_URL__
+const BRIDGE_URL = '__BRIDGE_URL__';
+const BRIDGE_HMAC_KEY = '__BRIDGE_HMAC_KEY__';`
+
+	h, err := setup.NewHandler(&fakeReader{}, testKey, testBridgeURL, testHMACKey, stubWithDownloadURL)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/userscript.user.js", nil)
+	req.Host = "setup.tail.ts.net:13083"
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	want := "http://setup.tail.ts.net:13083/userscript.user.js"
+	if !strings.Contains(body, want) {
+		t.Errorf("@downloadURL not substituted; expected %q in body, body=%q", want, body)
+	}
+	if strings.Contains(body, "__DOWNLOAD_URL__") {
+		t.Errorf("placeholder __DOWNLOAD_URL__ left in body: %q", body)
+	}
+}
+
+// Same as above but exercising the X-Forwarded-Proto path so the
+// rendered @downloadURL is https when fronted by a TLS terminator
+// (e.g. Tailscale Serve).
+func TestUserscriptDownloadURLSubstitution_HTTPS(t *testing.T) {
+	const stubWithDownloadURL = `// @downloadURL __DOWNLOAD_URL__`
+	h, err := setup.NewHandler(&fakeReader{}, testKey, testBridgeURL, testHMACKey, stubWithDownloadURL)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/userscript.user.js", nil)
+	req.Host = "setup.example.com"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	body := rr.Body.String()
+	want := "https://setup.example.com/userscript.user.js"
+	if !strings.Contains(body, want) {
+		t.Errorf("@downloadURL HTTPS path not substituted; expected %q in body, body=%q", want, body)
+	}
+}
