@@ -1,0 +1,34 @@
+name: "Ops — Sync multiplexer service key to qwickapps/mcp"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-key:
+    name: Set SLACK_MULTIPLEXER_URL and SLACK_MULTIPLEXER_SERVICE_KEY in qwickapps/mcp
+    runs-on: [self-hosted, macmini]
+    steps:
+      - name: Sync multiplexer secrets to qwickapps/mcp
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PUSH_TOKEN }}
+          SERVICE_KEY: ${{ secrets.SLACK_MCP_SERVER_DEV_MULTIPLEXER_SERVICE_KEY }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$SERVICE_KEY"
+
+          MULTIPLEXER_URL="http://slack-multiplexer-dev.taile324e7.ts.net:13082"
+
+          echo "Setting SLACK_MULTIPLEXER_URL in qwickapps/mcp..."
+          echo -n "$MULTIPLEXER_URL" | gh secret set SLACK_MULTIPLEXER_URL -R qwickapps/mcp --body -
+          echo "SLACK_MULTIPLEXER_URL set"
+
+          echo "Setting SLACK_MULTIPLEXER_SERVICE_KEY in qwickapps/mcp..."
+          echo -n "$SERVICE_KEY" | gh secret set SLACK_MULTIPLEXER_SERVICE_KEY -R qwickapps/mcp --body -
+          echo "SLACK_MULTIPLEXER_SERVICE_KEY set"
+
+          echo "Verifying secrets were set..."
+          gh secret list -R qwickapps/mcp | grep -E "SLACK_MULTIPLEXER"
+          echo "Done."
