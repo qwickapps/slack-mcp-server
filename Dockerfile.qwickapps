@@ -1,7 +1,7 @@
 # QwickApps deployment Dockerfile for slack-mcp-server.
 # This is a WRAPPER image — it pulls the pre-built binary from the upstream
-# published image and runs it inside the qwickapps-base image with the
-# canonical Tailscale entrypoint.
+# published image and runs it inside img-node with the canonical Tailscale
+# entrypoint.
 #
 # This file is NOT upstream's Dockerfile (which builds from source).
 # Upstream's Dockerfile is preserved at ./Dockerfile for reference.
@@ -31,9 +31,11 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/token-bridge ./cmd
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/multiplexer ./cmd/multiplexer
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/setup ./cmd/setup
 
-# qwickapps-base ships node + curl + tailscale + ca-certificates (see qwickapps/node Dockerfile).
-# If a future base rebuild drops these, the build below will fail loudly — that is the desired failure mode.
-FROM ghcr.io/qwickapps/qwickapps-base:latest@sha256:ecad995099c1dc8f1ad690be6ddb7cb0ad3d415cd948810170cf259e171c89b2
+# img-node ships node + curl + tailscale + ca-certificates (built by qwickapps/node).
+# qwickapps-base (the former base) did NOT include tailscale — containers crashed with
+# "tailscaled socket not ready after 20s". Use the same base as qwickapps/mcp and qwickapps/forge.
+ARG QWICKAPPS_NODE_IMAGE=ghcr.io/qwickapps/img-node:latest
+FROM ${QWICKAPPS_NODE_IMAGE}
 USER root
 
 # Pull upstream binary out of upstream image.
