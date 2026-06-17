@@ -16,6 +16,10 @@
 #   2. Update UPSTREAM_TAG and UPSTREAM_DIGEST below.
 #   3. Update UPSTREAM.md with the new version and date.
 
+# Global ARG must appear before any FROM so it can be referenced in the final
+# stage's FROM directive (Docker multi-stage scope rule).
+ARG QWICKAPPS_NODE_IMAGE=ghcr.io/qwickapps/img-node:latest
+
 # Pin upstream by tag AND digest. Update both when syncing.
 # v1.2.3 | sha256:7ae77761d9f6e8da2b0fc7e7bf9f489615865af533990e0e06bc3eed49e0b91e
 FROM ghcr.io/korotovsky/slack-mcp-server:v1.2.3@sha256:7ae77761d9f6e8da2b0fc7e7bf9f489615865af533990e0e06bc3eed49e0b91e AS upstream
@@ -34,7 +38,6 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/setup ./cmd/setup
 # img-node ships node + curl + tailscale + ca-certificates (built by qwickapps/node).
 # qwickapps-base (the former base) did NOT include tailscale — containers crashed with
 # "tailscaled socket not ready after 20s". Use the same base as qwickapps/mcp and qwickapps/forge.
-ARG QWICKAPPS_NODE_IMAGE=ghcr.io/qwickapps/img-node:latest
 FROM ${QWICKAPPS_NODE_IMAGE}
 USER root
 
